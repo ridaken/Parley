@@ -13,6 +13,29 @@ import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wails
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
 import * as audio$0 from "./internal/audio/models.js";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
+import * as store$0 from "./internal/store/models.js";
+
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
+import * as $models from "./models.js";
+
+/**
+ * AddLiveNote injects user context mid-meeting. scope is "meeting" (whole
+ * session) or "topic" (current topic only); it is fed to the analysis engine and
+ * persisted with the session.
+ */
+export function AddLiveNote(scope: string, text: string): $CancellablePromise<store$0.LiveNote> {
+    return $Call.ByID(1344950533, scope, text);
+}
+
+/**
+ * DeleteSession permanently removes a saved meeting (not the one in progress).
+ */
+export function DeleteSession(id: number): $CancellablePromise<void> {
+    return $Call.ByID(4268697921, id);
+}
 
 /**
  * IsRunning reports whether a session is active.
@@ -29,7 +52,37 @@ export function ListDevices(): $CancellablePromise<audio$0.DeviceInfo[] | null> 
 }
 
 /**
- * Start launches the whisper server, begins capture, and starts transcribing.
+ * ListSessions returns saved meetings, newest first.
+ */
+export function ListSessions(): $CancellablePromise<store$0.Session[] | null> {
+    return $Call.ByID(1774945289);
+}
+
+/**
+ * LoadSession returns a saved meeting's full state for display.
+ */
+export function LoadSession(id: number): $CancellablePromise<$models.LoadedSession> {
+    return $Call.ByID(1403894156, id);
+}
+
+/**
+ * RenameSession changes a saved meeting's title.
+ */
+export function RenameSession(id: number, title: string): $CancellablePromise<void> {
+    return $Call.ByID(3925232594, id, title);
+}
+
+/**
+ * Resume continues a previously saved meeting, appending new transcript/analysis
+ * to it. Pass the session id returned by ListSessions.
+ */
+export function Resume(id: number): $CancellablePromise<void> {
+    return $Call.ByID(2982998431, id);
+}
+
+/**
+ * Start launches a fresh meeting: whisper server, capture, transcription, and a
+ * new persisted session.
  */
 export function Start(): $CancellablePromise<void> {
     return $Call.ByID(4124033072);

@@ -46,3 +46,10 @@ func dbPath() string {
 	_ = os.MkdirAll(dir, 0o755)
 	return filepath.Join(dir, "parley.db")
 }
+
+// logPath is the application log file (diagnostics for support).
+func logPath() string {
+	dir := dataDir()
+	_ = os.MkdirAll(dir, 0o755)
+	return filepath.Join(dir, "parley.log")
+}

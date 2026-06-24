@@ -87,7 +87,14 @@ func (c *Chunker) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			c.flush(ctx) // final partial flush
+			// Final partial flush must outlive the cancelled ctx, otherwise the
+			// last chunk's transcription request is aborted before it runs and
+			// the tail of the meeting is lost. Wait for the spawned transcription
+			// goroutines before cancelling, so fctx stays live for the request.
+			fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			c.flush(fctx)
+			c.wg.Wait()
+			cancel()
 			return
 		case <-t.C:
 			c.flush(ctx)

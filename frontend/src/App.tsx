@@ -1,21 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import { Events } from "@wailsio/runtime";
 import {
+  AlertTriangle,
   AudioLines,
+  History,
   Loader2,
-  Mic,
-  MicOff,
   MessageSquareText,
   NotebookPen,
   Settings as SettingsIcon,
-  SlidersHorizontal,
   Square,
+  X,
 } from "lucide-react";
 
-import { MeetingService } from "../bindings/github.com/tomvokac/parley";
+import { MeetingService, LibraryService } from "../bindings/github.com/tomvokac/parley";
 import type { StatusEvent } from "../bindings/github.com/tomvokac/parley";
 import type { Segment } from "../bindings/github.com/tomvokac/parley/internal/stt/models";
 import type { State as AnalysisState } from "../bindings/github.com/tomvokac/parley/internal/analysis/models";
+import type { LiveNote } from "../bindings/github.com/tomvokac/parley/internal/store/models";
+import type { LoadedSession } from "../bindings/github.com/tomvokac/parley/models";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -26,6 +28,9 @@ import { AnalysisPanels } from "@/components/AnalysisPanels";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { ContextDialog } from "@/components/ContextDialog";
 import { AudioDialog } from "@/components/AudioDialog";
+import { AudioSourceButton } from "@/components/AudioSourceButton";
+import { SessionsDialog } from "@/components/SessionsDialog";
+import { LiveContextBar, type NoteScope } from "@/components/LiveContextBar";
 import { speakerVariant } from "@/lib/speaker";
 
 function fmtTime(ms: number): string {
@@ -83,11 +88,31 @@ function App() {
   });
   const [segments, setSegments] = useState<Segment[]>([]);
   const [analysis, setAnalysis] = useState<AnalysisState>(EMPTY_ANALYSIS);
+  const [notes, setNotes] = useState<LiveNote[]>([]);
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
+  const [loaded, setLoaded] = useState<{ id: number; title: string } | null>(null);
+  const [micConfigured, setMicConfigured] = useState(true);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // Reflect whether a microphone is configured (or defaulted) so the header is
+  // meaningful before a session starts. Empty config = default mic + system audio.
+  const refreshMicConfig = () => {
+    LibraryService.GetSettings()
+      .then((s) => {
+        const srcs = s?.captureSources ?? [];
+        setMicConfigured(srcs.length === 0 || srcs.some((c) => c.kind === "input"));
+      })
+      .catch(() => {});
+  };
+
+  // Refresh on mount and whenever the audio dialog closes (selection may have changed).
+  useEffect(() => {
+    if (!audioOpen) refreshMicConfig();
+  }, [audioOpen]);
 
   useEffect(() => {
     MeetingService.IsRunning()
@@ -104,7 +129,13 @@ function App() {
       setSegments((prev) => [...prev, e.data].sort((a, b) => a.startMs - b.startMs));
     });
     const offAnalysis = Events.On("analysis", (e: { data: AnalysisState }) => {
-      setAnalysis(e.data ?? EMPTY_ANALYSIS);
+      const next = e.data ?? EMPTY_ANALYSIS;
+      setAnalysis(next);
+      // Mirror the backend: topic-scoped notes expire when the topic changes.
+      const title = next.current?.title ?? "";
+      setNotes((prev) =>
+        prev.filter((n) => n.scope === "meeting" || n.topicTitle === title)
+      );
     });
     return () => {
       offStatus();
@@ -124,9 +155,13 @@ function App() {
     try {
       if (running) {
         await MeetingService.Stop();
+      } else if (loaded) {
+        // A saved meeting is open — continue it.
+        await MeetingService.Resume(loaded.id);
       } else {
         setSegments([]);
         setAnalysis(EMPTY_ANALYSIS);
+        setNotes([]);
         await MeetingService.Start();
       }
     } catch (err) {
@@ -134,6 +169,43 @@ function App() {
       setBusy(false);
     }
   };
+
+  const sendNote = async (scope: NoteScope, text: string) => {
+    try {
+      const note = await MeetingService.AddLiveNote(scope, text);
+      if (note?.text) setNotes((prev) => [...prev, note]);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const viewSession = (s: LoadedSession) => {
+    setSegments([...(s.segments ?? [])].sort((a, b) => a.startMs - b.startMs));
+    setAnalysis(s.analysis ?? EMPTY_ANALYSIS);
+    setNotes(s.liveNotes ?? []);
+    setLoaded({ id: s.session.id, title: s.session.title });
+  };
+
+  const resumeSession = async (id: number) => {
+    setBusy(true);
+    try {
+      const s = await MeetingService.LoadSession(id);
+      viewSession(s);
+      await MeetingService.Resume(id);
+    } catch (err) {
+      console.error(err);
+      setBusy(false);
+    }
+  };
+
+  const clearLoaded = () => {
+    setLoaded(null);
+    setSegments([]);
+    setAnalysis(EMPTY_ANALYSIS);
+    setNotes([]);
+  };
+
+  const startLabel = loaded ? "Resume meeting" : "Start listening";
 
   return (
     <div className="flex h-screen flex-col">
@@ -153,22 +225,20 @@ function App() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
-          <Badge variant={status.micAvailable ? "you" : "secondary"}>
-            {status.micAvailable ? (
-              <Mic className="h-3 w-3" />
-            ) : (
-              <MicOff className="h-3 w-3" />
-            )}
-            {status.micAvailable ? "Mic active" : "No mic"}
-          </Badge>
+          <AudioSourceButton
+            status={status}
+            micConfigured={micConfigured}
+            running={running}
+            onOpen={() => setAudioOpen(true)}
+          />
 
           <Button
             variant="ghost"
             size="icon"
-            title="Audio sources"
-            onClick={() => setAudioOpen(true)}
+            title="Saved meetings"
+            onClick={() => setSessionsOpen(true)}
           >
-            <SlidersHorizontal className="h-4 w-4" />
+            <History className="h-4 w-4" />
           </Button>
           <Button
             variant="ghost"
@@ -202,12 +272,44 @@ function App() {
             ) : (
               <>
                 <span className="inline-flex h-2.5 w-2.5 rounded-full bg-current" />
-                Start listening
+                {startLabel}
               </>
             )}
           </Button>
         </div>
       </header>
+
+      {status.state === "error" && status.message && (
+        <div className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-5 py-2 text-sm text-destructive">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">
+            {status.message}{" "}
+            <span className="text-destructive/70">
+              Details were written to the log file (parley.log in your app data
+              folder).
+            </span>
+          </span>
+        </div>
+      )}
+
+      {loaded && !running && (
+        <div className="flex items-center gap-2 border-b bg-accent/30 px-5 py-2 text-sm">
+          <History className="h-4 w-4 text-muted-foreground" />
+          <span className="min-w-0 truncate">
+            Viewing saved meeting{" "}
+            <span className="font-medium">{loaded.title}</span> — press{" "}
+            <span className="font-medium">Resume meeting</span> to continue it.
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto"
+            onClick={clearLoaded}
+          >
+            <X className="h-4 w-4" /> New meeting
+          </Button>
+        </div>
+      )}
 
       <main className="grid min-h-0 flex-1 grid-cols-[minmax(360px,420px)_1fr] gap-4 p-4">
         <Card className="min-h-0">
@@ -245,6 +347,23 @@ function App() {
               )}
             </ScrollArea>
           </CardContent>
+
+          {notes.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-4 pb-1 pt-2">
+              {notes.map((n, i) => (
+                <Badge
+                  key={i}
+                  variant={n.scope === "meeting" ? "you" : "secondary"}
+                  className="max-w-full"
+                  title={n.scope === "meeting" ? "Applies all meeting" : "Applies to current topic"}
+                >
+                  <span className="truncate">{n.text}</span>
+                </Badge>
+              ))}
+            </div>
+          )}
+
+          <LiveContextBar disabled={!running} onSend={sendNote} />
         </Card>
 
         <AnalysisPanels state={analysis} active={running} />
@@ -253,6 +372,13 @@ function App() {
       <AudioDialog open={audioOpen} onOpenChange={setAudioOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <ContextDialog open={contextOpen} onOpenChange={setContextOpen} />
+      <SessionsDialog
+        open={sessionsOpen}
+        onOpenChange={setSessionsOpen}
+        onView={viewSession}
+        onResume={resumeSession}
+        disabled={running}
+      />
     </div>
   );
 }

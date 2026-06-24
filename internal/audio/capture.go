@@ -2,6 +2,8 @@ package audio
 
 import (
 	"fmt"
+	"log"
+	"strings"
 
 	"github.com/gen2brain/malgo"
 )
@@ -79,10 +81,11 @@ func ListDevices() ([]DeviceInfo, error) {
 // mono S16, delivering copied sample slices (tagged with the source label) to
 // onSamples.
 type Capturer struct {
-	mctx      *malgo.AllocatedContext
-	devices   []*malgo.Device
-	onSamples func(Source, []int16)
-	active    []Source
+	mctx        *malgo.AllocatedContext
+	devices     []*malgo.Device
+	onSamples   func(Source, []int16)
+	active      []Source
+	activeSpecs []SourceSpec
 }
 
 // NewCapturer initialises an audio context.
@@ -100,20 +103,39 @@ func (c *Capturer) Start(specs []SourceSpec) error {
 	captureInfos, _ := c.mctx.Devices(malgo.Capture)
 	playbackInfos, _ := c.mctx.Devices(malgo.Playback)
 
+	var failures []string
 	for _, sp := range specs {
 		dev, err := c.openSource(sp, captureInfos, playbackInfos)
 		if err != nil {
-			fmt.Printf("[audio] source %q (%s) unavailable: %v\n", sp.Label, sp.Kind, err)
+			log.Printf("[audio] source %q (%s, id=%q) unavailable: %v", sp.Label, sp.Kind, sp.ID, err)
+			failures = append(failures, fmt.Sprintf("%s (%s): %v", sp.Label, sp.Kind, err))
 			continue
 		}
 		c.devices = append(c.devices, dev)
 		c.active = append(c.active, sp.Label)
+		c.activeSpecs = append(c.activeSpecs, sp)
 	}
 	if len(c.devices) == 0 {
 		c.Stop()
+		if len(failures) > 0 {
+			return fmt.Errorf("no audio sources could be started: %s", strings.Join(failures, "; "))
+		}
 		return fmt.Errorf("no audio sources could be started")
 	}
 	return nil
+}
+
+// ActiveSpecs returns the source specs that started successfully.
+func (c *Capturer) ActiveSpecs() []SourceSpec { return c.activeSpecs }
+
+// HasMic reports whether any started source is a microphone/line input.
+func (c *Capturer) HasMic() bool {
+	for _, sp := range c.activeSpecs {
+		if sp.Kind == KindInput {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Capturer) openSource(sp SourceSpec, captureInfos, playbackInfos []malgo.DeviceInfo) (*malgo.Device, error) {

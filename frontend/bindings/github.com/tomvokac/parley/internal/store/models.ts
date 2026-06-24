@@ -27,6 +27,27 @@ export interface CaptureSource {
 }
 
 /**
+ * LiveNote is a piece of context the user injects mid-meeting. A "meeting"-scoped
+ * note applies for the whole session (names, themes); a "topic"-scoped note only
+ * applies while its topic is current and expires when the topic rolls over.
+ */
+export interface LiveNote {
+    "id": number;
+
+    /**
+     * "meeting" | "topic"
+     */
+    "scope": string;
+
+    /**
+     * topic active when a "topic" note was added
+     */
+    "topicTitle": string;
+    "text": string;
+    "createdAt": string;
+}
+
+/**
  * Profile is reusable context the user supplies to ground the analysis.
  */
 export interface Profile {
@@ -39,6 +60,23 @@ export interface Profile {
 }
 
 /**
+ * Session is a (possibly multi-part) recorded meeting.
+ */
+export interface Session {
+    "id": number;
+    "title": string;
+    "startedAt": string;
+    "endedAt": string;
+    "profileID": number;
+    "audioDir": string;
+
+    /**
+     * populated by ListSessions for the browser
+     */
+    "segmentCount": number;
+}
+
+/**
  * Settings holds app-wide configuration (the API key is never included here).
  */
 export interface Settings {
@@ -48,4 +86,16 @@ export interface Settings {
     "activeProfileID": number;
     "hasAPIKey": boolean;
     "captureSources": CaptureSource[] | null;
+
+    /**
+     * SttBaseURL, when set, points transcription at a remote whisper.cpp-compatible
+     * server (e.g. http://host:8765) instead of launching the bundled engine.
+     */
+    "sttBaseURL": string;
+
+    /**
+     * WhisperModel is the model filename under resources/whisper/models used by the
+     * bundled engine. A small model (e.g. ggml-base.en.bin) keeps CPU use light.
+     */
+    "whisperModel": string;
 }

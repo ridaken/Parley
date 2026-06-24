@@ -23,7 +23,27 @@ const DEFAULTS: Settings = {
   activeProfileID: 0,
   hasAPIKey: false,
   captureSources: [],
+  sttBaseURL: "",
+  whisperModel: "ggml-small.en-q5_1.bin",
 };
+
+// friendlyError turns a raw backend/transport error into something actionable.
+function friendlyError(raw: string): string {
+  const lower = raw.toLowerCase();
+  if (lower.includes("context deadline exceeded") || lower.includes("timeout")) {
+    return "The endpoint didn't respond in time. Check the URL and port, make sure the server is running, and (for local servers) that the model has finished loading.";
+  }
+  if (lower.includes("connection refused") || lower.includes("no such host") || lower.includes("dial")) {
+    return "Couldn't reach that address. Double-check the host/port and that the server is started.";
+  }
+  if (lower.includes("401") || lower.includes("unauthorized") || lower.includes("api key")) {
+    return "The server rejected the request — the API key looks missing or wrong.";
+  }
+  if (lower.includes("404") || lower.includes("not found")) {
+    return "The endpoint responded but the path/model wasn't found. Confirm the Base URL ends in /v1 and the model name is correct.";
+  }
+  return raw;
+}
 
 export function SettingsDialog({
   open,
@@ -67,15 +87,15 @@ export function SettingsDialog({
       setTestMsg("Connected — the model responded.");
     } catch (e: any) {
       setTest("fail");
-      setTestMsg(String(e?.message ?? e));
+      setTestMsg(friendlyError(String(e?.message ?? e)));
     }
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>LLM settings</DialogTitle>
+          <DialogTitle>Settings</DialogTitle>
           <DialogDescription>
             Point Parley at any OpenAI-compatible endpoint — a local llama-server /
             LM Studio / Ollama, or a cloud URL. Local stays private.
@@ -133,21 +153,64 @@ export function SettingsDialog({
             />
           </div>
 
+          <div className="mt-1 border-t pt-3">
+            <div className="mb-2 text-sm font-medium">Transcription</div>
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="stturl">Remote transcription URL (optional)</Label>
+                <Input
+                  id="stturl"
+                  value={settings.sttBaseURL}
+                  placeholder="leave blank to use the bundled engine"
+                  onChange={(e) =>
+                    setSettings({ ...settings, sttBaseURL: e.target.value })
+                  }
+                />
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Blank = transcribe locally with the bundled Whisper model (private,
+                  no setup). Set this to a whisper.cpp server URL (e.g.
+                  http://192.168.1.10:8765) to offload transcription to another machine.
+                </p>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="whispermodel">Bundled model file</Label>
+                <Input
+                  id="whispermodel"
+                  value={settings.whisperModel}
+                  placeholder="ggml-small.en-q5_1.bin"
+                  disabled={!!settings.sttBaseURL.trim()}
+                  onChange={(e) =>
+                    setSettings({ ...settings, whisperModel: e.target.value })
+                  }
+                />
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Filename under resources/whisper/models. Defaults to
+                  ggml-small.en-q5_1.bin — quantized, accurate on names/jargon, and
+                  light enough to leave your laptop free for other work. Drop in
+                  ggml-base.en.bin for a lighter load, or ggml-large-v3-turbo-q5_0.bin
+                  for top accuracy if you have CPU headroom.
+                </p>
+              </div>
+            </div>
+          </div>
+
           {test !== "idle" && (
             <div
               className={
-                "flex items-center gap-2 text-xs " +
+                "flex items-start gap-2 rounded-md border p-2 text-xs " +
                 (test === "ok"
-                  ? "text-emerald-400"
+                  ? "border-emerald-500/30 text-emerald-400"
                   : test === "fail"
-                  ? "text-destructive"
-                  : "text-muted-foreground")
+                  ? "border-destructive/30 text-destructive"
+                  : "border-border text-muted-foreground")
               }
             >
-              {test === "running" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              {test === "ok" && <CheckCircle2 className="h-3.5 w-3.5" />}
-              {test === "fail" && <XCircle className="h-3.5 w-3.5" />}
-              <span className="truncate">
+              {test === "running" && (
+                <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />
+              )}
+              {test === "ok" && <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+              {test === "fail" && <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+              <span className="min-w-0 break-words">
                 {test === "running" ? "Testing…" : testMsg}
               </span>
             </div>
