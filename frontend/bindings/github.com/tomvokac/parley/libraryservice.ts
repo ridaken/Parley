@@ -15,6 +15,13 @@ import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wails
 import * as store$0 from "./internal/store/models.js";
 
 /**
+ * DeleteLLMConnection removes a connection (and its stored key).
+ */
+export function DeleteLLMConnection(id: number): $CancellablePromise<void> {
+    return $Call.ByID(2410204140, id);
+}
+
+/**
  * DeleteProfile removes a context profile.
  */
 export function DeleteProfile(id: number): $CancellablePromise<void> {
@@ -29,10 +36,24 @@ export function GetSettings(): $CancellablePromise<store$0.Settings> {
 }
 
 /**
+ * ListLLMConnections returns all saved LLM connections (newest-updated first).
+ */
+export function ListLLMConnections(): $CancellablePromise<store$0.LLMConnection[] | null> {
+    return $Call.ByID(1408212254);
+}
+
+/**
  * ListProfiles returns all saved context profiles.
  */
 export function ListProfiles(): $CancellablePromise<store$0.Profile[] | null> {
     return $Call.ByID(3577742188);
+}
+
+/**
+ * SaveLLMConnection inserts or updates a connection and returns the saved row.
+ */
+export function SaveLLMConnection(c: store$0.LLMConnection): $CancellablePromise<store$0.LLMConnection> {
+    return $Call.ByID(3797665110, c);
 }
 
 /**
@@ -57,8 +78,30 @@ export function SetAPIKey(key: string): $CancellablePromise<void> {
 }
 
 /**
- * TestConnection verifies the configured LLM endpoint/model/key respond.
+ * SetActiveLLMConnection selects which connection drives analysis.
+ */
+export function SetActiveLLMConnection(id: number): $CancellablePromise<void> {
+    return $Call.ByID(4163508935, id);
+}
+
+/**
+ * SetConnectionAPIKey stores or clears a connection's API key in the keychain.
+ */
+export function SetConnectionAPIKey(id: number, key: string): $CancellablePromise<void> {
+    return $Call.ByID(3946126701, id, key);
+}
+
+/**
+ * TestConnection verifies the active LLM connection's endpoint/model/key respond.
  */
 export function TestConnection(): $CancellablePromise<void> {
     return $Call.ByID(3263505778);
+}
+
+/**
+ * TestLLMConnection verifies a specific saved connection responds. The UI saves
+ * edits (and key) before calling this, so it tests the persisted values.
+ */
+export function TestLLMConnection(id: number): $CancellablePromise<void> {
+    return $Call.ByID(3778119277, id);
 }

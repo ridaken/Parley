@@ -4,7 +4,7 @@
 //
 // Run with audio playing on your default output device, and speak into your mic:
 //
-//	go run ./cmd/audiospike
+//	go run ./spikes/audiospike
 //
 // It prints per-channel level stats so you can tell whether real signal was
 // captured on each side, then writes capture.wav.

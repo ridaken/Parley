@@ -25,6 +25,12 @@ func init() {
 }
 
 func main() {
+	// Immediately drop any console window Windows allocated for us (e.g. a
+	// console-subsystem build or a double-click launch) before anything renders,
+	// so a stray terminal never lingers at launch. No-op for a GUI-subsystem
+	// build or when launched from the user's own shell.
+	hideOwnedConsole()
+
 	logFile := setupLogging()
 	if logFile != nil {
 		defer logFile.Close()
