@@ -109,7 +109,8 @@ export interface Settings {
 
     /**
      * WhisperModel is the model filename under resources/whisper/models used by the
-     * bundled engine. A small model (e.g. ggml-base.en.bin) keeps CPU use light.
+     * bundled engine. Defaults to ggml-small.en-q5_1.bin (quantized; accurate but
+     * light on CPU).
      */
     "whisperModel": string;
 

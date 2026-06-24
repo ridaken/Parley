@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { FileUp, Plus, Star, Trash2 } from "lucide-react";
+import {
+  Check,
+  FileUp,
+  Loader2,
+  Plus,
+  Sparkles,
+  Star,
+  Trash2,
+  X,
+} from "lucide-react";
 
 import { LibraryService } from "../../bindings/github.com/tomvokac/parley";
 import type { Profile } from "../../bindings/github.com/tomvokac/parley/internal/store/models";
@@ -42,6 +51,18 @@ export function ContextDialog({
   const [activeId, setActiveId] = useState<number>(0);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
+  // AI condense ("minimize") of the notes field: proposed result is previewed
+  // and only applied on the user's confirmation, so we never silently rewrite
+  // what they typed.
+  const [condensing, setCondensing] = useState(false);
+  const [condensed, setCondensed] = useState<string | null>(null);
+  const [condenseErr, setCondenseErr] = useState<string | null>(null);
+
+  const clearCondense = () => {
+    setCondensed(null);
+    setCondenseErr(null);
+  };
+
   const refresh = async () => {
     const [list, settings] = await Promise.all([
       LibraryService.ListProfiles(),
@@ -53,7 +74,32 @@ export function ContextDialog({
 
   useEffect(() => {
     if (open) refresh().catch(console.error);
+    else clearCondense();
   }, [open]);
+
+  // Ask the active LLM to shrink the notes. The result is held as a preview
+  // (applyCondensed commits it); clearCondense drops a stale proposal whenever
+  // the underlying notes change, so it can't be applied to the wrong text.
+  const condense = async () => {
+    const text = draft.notes.trim();
+    if (!text || condensing) return;
+    setCondensing(true);
+    setCondenseErr(null);
+    setCondensed(null);
+    try {
+      const result = await LibraryService.CondenseContext(text);
+      setCondensed(result);
+    } catch (err) {
+      setCondenseErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCondensing(false);
+    }
+  };
+
+  const applyCondensed = () => {
+    if (condensed != null) setDraft((d) => ({ ...d, notes: condensed }));
+    clearCondense();
+  };
 
   const save = async () => {
     if (!draft.name.trim()) {
@@ -87,6 +133,7 @@ export function ContextDialog({
       name: d.name || file.name.replace(/\.[^.]+$/, ""),
       notes: d.notes ? d.notes + "\n\n" + text : text,
     }));
+    clearCondense();
   };
 
   return (
@@ -111,7 +158,10 @@ export function ContextDialog({
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={() => setDraft(BLANK)}
+                onClick={() => {
+                  setDraft(BLANK);
+                  clearCondense();
+                }}
                 title="New context"
               >
                 <Plus className="h-4 w-4" />
@@ -127,7 +177,10 @@ export function ContextDialog({
                 {profiles.map((p) => (
                   <button
                     key={p.id}
-                    onClick={() => setDraft(p)}
+                    onClick={() => {
+                      setDraft(p);
+                      clearCondense();
+                    }}
                     className={cn(
                       "flex items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent",
                       draft.id === p.id && "bg-accent"
@@ -173,14 +226,61 @@ export function ContextDialog({
               />
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="ctx-notes">Notes</Label>
+              <div className="flex items-center justify-between">
+                <Label htmlFor="ctx-notes">Notes</Label>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 gap-1.5 text-xs"
+                  disabled={!draft.notes.trim() || condensing}
+                  onClick={condense}
+                  title="Use the active LLM to shrink these notes while keeping the key facts"
+                >
+                  {condensing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5" />
+                  )}
+                  Condense with AI
+                </Button>
+              </div>
               <Textarea
                 id="ctx-notes"
                 value={draft.notes}
                 className="min-h-24"
-                placeholder="Anything else that helps the assistant follow along…"
-                onChange={(e) => setDraft({ ...draft, notes: e.target.value })}
+                placeholder="Paste documents, background, agenda detail — anything that helps the assistant follow along…"
+                onChange={(e) => {
+                  setDraft({ ...draft, notes: e.target.value });
+                  clearCondense();
+                }}
               />
+              {condenseErr && (
+                <p className="text-xs text-destructive">{condenseErr}</p>
+              )}
+              {condensed != null && (
+                <div className="flex flex-col gap-2 rounded-md border border-primary/40 bg-primary/5 p-2.5">
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
+                    <Sparkles className="h-3.5 w-3.5" />
+                    Condensed preview
+                    <span className="font-normal text-muted-foreground">
+                      {draft.notes.length} → {condensed.length} chars
+                    </span>
+                  </div>
+                  <ScrollArea className="max-h-40 rounded border bg-background">
+                    <p className="whitespace-pre-wrap p-2 text-sm leading-relaxed">
+                      {condensed}
+                    </p>
+                  </ScrollArea>
+                  <div className="flex justify-end gap-2">
+                    <Button size="sm" variant="ghost" onClick={clearCondense}>
+                      <X className="h-3.5 w-3.5" /> Discard
+                    </Button>
+                    <Button size="sm" onClick={applyCondensed}>
+                      <Check className="h-3.5 w-3.5" /> Replace notes
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
             <input
               ref={fileRef}

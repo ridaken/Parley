@@ -15,6 +15,16 @@ import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wails
 import * as store$0 from "./internal/store/models.js";
 
 /**
+ * CondenseContext uses the active LLM connection to compress user-supplied
+ * meeting context (typically the free-form notes, where pasted documents land)
+ * into a denser form that preserves the concrete facts. It returns the condensed
+ * text for the UI to preview; it never mutates a saved profile itself.
+ */
+export function CondenseContext(text: string): $CancellablePromise<string> {
+    return $Call.ByID(3402042464, text);
+}
+
+/**
  * DeleteLLMConnection removes a connection (and its stored key).
  */
 export function DeleteLLMConnection(id: number): $CancellablePromise<void> {

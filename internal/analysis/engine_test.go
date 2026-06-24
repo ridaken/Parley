@@ -147,6 +147,42 @@ func TestRestoreSeedsStateWithoutReanalyzing(t *testing.T) {
 	}
 }
 
+func TestEngineKeepsStableTitleWhenTopicUnchanged(t *testing.T) {
+	// The model establishes a title, then on the next pass rewords it but reports
+	// topicChanged:false. The engine must keep the original wording and not archive.
+	replies := []string{
+		`{"currentTopicTitle":"Budget planning","currentTopicSummary":"a","topicChanged":false,"assertions":[],"suggestions":[]}`,
+		`{"currentTopicTitle":"Planning the budget","currentTopicSummary":"b","topicChanged":false,"assertions":[],"suggestions":[]}`,
+	}
+	var idx int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		content := replies[idx%len(replies)]
+		idx++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": content}}},
+		})
+	}))
+	defer srv.Close()
+
+	done := make(chan State, 2)
+	eng := NewEngine(llm.NewClient(srv.URL, "", "m"), 3*time.Second, Context{}, func(s State) { done <- s })
+
+	eng.analyze(context.Background(), "Others: line one\n", "", nil)
+	<-done // establishes "Budget planning"
+
+	eng.analyze(context.Background(), "Others: line two\n", "Budget planning", nil)
+	s := <-done
+	if s.Current.Title != "Budget planning" {
+		t.Fatalf("title churned to %q, want stable %q", s.Current.Title, "Budget planning")
+	}
+	if s.Current.Summary != "b" {
+		t.Fatalf("summary should still update: %q", s.Current.Summary)
+	}
+	if len(s.Past) != 0 {
+		t.Fatalf("unchanged topic must not be archived: %+v", s.Past)
+	}
+}
+
 func TestFeedThenAnalyzeEmitsAndThenSkipsWithoutNewContent(t *testing.T) {
 	content := `{"currentTopicTitle":"Onboarding","currentTopicSummary":"New hire setup.","topicChanged":true,"assertions":[{"speaker":"You","text":"Need a laptop."}],"suggestions":[]}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

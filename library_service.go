@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tomvokac/parley/internal/llm"
@@ -102,4 +103,44 @@ func (l *LibraryService) SaveProfile(p store.Profile) (store.Profile, error) {
 // DeleteProfile removes a context profile.
 func (l *LibraryService) DeleteProfile(id int64) error {
 	return l.store.DeleteProfile(id)
+}
+
+// condenseSystemPrompt instructs the model to tighten user-supplied meeting
+// background into the densest form that still grounds the live analysis. It must
+// preserve concrete facts and add nothing, so the result is safe to feed back as
+// context for every analysis pass.
+const condenseSystemPrompt = `You compress meeting-prep notes for an AI meeting assistant that will read them as background on every analysis pass. Rewrite the provided context to be as short as possible while preserving EVERY concrete fact: people's names and their spellings, roles, organizations, acronyms and what they stand for, project/product names, dates, figures, goals, decisions already made, and open questions. Remove redundancy, repetition, filler, pleasantries, and anything not useful as background. Use terse bullet points or short phrases. Do NOT invent, infer, or add any information that is not present in the input. Output only the condensed notes as plain text — no preamble, no commentary, no markdown headers.`
+
+// CondenseContext uses the active LLM connection to compress user-supplied
+// meeting context (typically the free-form notes, where pasted documents land)
+// into a denser form that preserves the concrete facts. It returns the condensed
+// text for the UI to preview; it never mutates a saved profile itself.
+func (l *LibraryService) CondenseContext(text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", fmt.Errorf("nothing to condense")
+	}
+
+	conn, err := l.store.GetActiveLLMConnection()
+	if err != nil || conn.BaseURL == "" {
+		return "", fmt.Errorf("no LLM connection is configured — set one in Settings before condensing")
+	}
+
+	key, _ := l.store.GetConnectionAPIKey(conn.ID)
+	client := llm.NewClient(conn.BaseURL, key, conn.Model)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	reply, err := client.Complete(ctx, []llm.Message{
+		{Role: "system", Content: condenseSystemPrompt},
+		{Role: "user", Content: text},
+	})
+	if err != nil {
+		return "", err
+	}
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		return "", fmt.Errorf("the model returned an empty result")
+	}
+	return reply, nil
 }
