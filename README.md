@@ -176,8 +176,15 @@ Return the JSON object now.
 | [Go](https://go.dev/dl/) 1.25+ | Backend. |
 | Node.js 18+ / npm | Frontend. |
 | [Wails 3 CLI](https://v3.wails.io/) | `go install github.com/wailsapp/wails/v3/cmd/wails3@latest` |
-| [Task](https://taskfile.dev/) | Build runner (`Taskfile.yml`). |
+| [Task](https://taskfile.dev/) | **Optional** shortcut runner for `Taskfile.yml`. See the note below. |
 | **A C compiler (cgo)** | Required by the audio library (`malgo`). See per-OS notes. |
+
+> **Seeing `'task' is not recognized`?** `task` is the optional [Task](https://taskfile.dev/)
+> runner — a separate tool, **not** a Windows built-in — so that error just means you
+> haven't installed it. You don't need it. Anywhere this README says `task <name>`, you can:
+> - run the plain command shown next to it, **or**
+> - run `wails3 task <name>` instead (the Wails CLI you already have includes a Task runner), **or**
+> - install Task once: `winget install Task.Task` (or `go install github.com/go-task/task/v3/cmd/task@latest`).
 
 ### C toolchain (cgo) — required
 
@@ -196,12 +203,14 @@ Audio capture uses miniaudio via cgo, so a C compiler must be on `PATH`:
 The whisper binaries and model are **large and not committed** (see `.gitignore`),
 and the app does **not** auto-download them. Fetch them with the setup script:
 
-```bash
-task setup:whisper
-# or, without Task:
+```powershell
+# Run from the repo root in PowerShell. This is all `task setup:whisper` does:
 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup-whisper.ps1
-# options:
-pwsh ./scripts/setup-whisper.ps1 -Model ggml-tiny.en.bin -Variant blas
+
+# Equivalent shortcuts (only if you have the runners): task setup:whisper  /  wails3 task setup:whisper
+
+# Options (smaller/faster model, or a BLAS build):
+pwsh ./scripts/setup-whisper.ps1 -Model ggml-base.en.bin -Variant blas
 ```
 
 This places everything where Parley looks:
@@ -259,14 +268,18 @@ and set **Settings → Transcription → Remote transcription URL** (e.g.
 
 ```bash
 # Development (hot reload). Uses a Vite port to avoid clashing with other dev servers.
-task dev
+task dev        # no Task? → wails3 dev -config ./build/config.yml -port 9245
 
 # Production build → ./bin
-task build
+task build      # no Task? → wails3 task build
 
 # Package an installer
-task package
+task package    # no Task? → wails3 task package
 ```
+
+> The `build`/`package` recipes set important flags (e.g. `-H windowsgui`, so no
+> console window appears). Prefer `task …` or `wails3 task …` over a bare
+> `wails3 build` so those flags are applied — or install Task (see Prerequisites).
 
 When packaging, make sure the `resources/whisper/` folder ships **next to the
 executable** (Parley searches the working dir and the exe's directory + parents).
