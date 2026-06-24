@@ -116,7 +116,16 @@ func (m *MeetingService) start(resumeID int64) error {
 		}
 		modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
 		if err != nil {
-			return m.fail(fmt.Sprintf("Transcription model %q is missing. Run \"task setup:whisper\" to fetch it, add it under resources/whisper/models, pick another in Settings, or use a remote URL.", modelName), err)
+			// The configured filename isn't present — commonly because the default
+			// model changed but a stale name is still saved in Settings, or a
+			// differently-named file was downloaded. Rather than hard-fail, fall
+			// back to whatever model IS installed so the app keeps working.
+			if alt, altName, ok := anyInstalledModel(); ok {
+				log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
+				modelPath = alt
+			} else {
+				return m.fail(fmt.Sprintf("Transcription model %q is missing and no model is installed under resources/whisper/models. Run scripts/setup-whisper.ps1 to fetch one, pick another in Settings, or use a remote URL.", modelName), err)
+			}
 		}
 
 		m.server = stt.NewServer(binPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
@@ -167,6 +176,26 @@ func (m *MeetingService) stopServer() {
 		m.server.Stop()
 		m.server = nil
 	}
+}
+
+// anyInstalledModel returns the first *.bin model present under
+// resources/whisper/models, used as a fallback when the model filename saved in
+// Settings doesn't match what's actually installed.
+func anyInstalledModel() (path, name string, ok bool) {
+	dir, err := resolveResource(filepath.Join("resources", "whisper", "models"))
+	if err != nil {
+		return "", "", false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", "", false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".bin") {
+			return filepath.Join(dir, e.Name()), e.Name(), true
+		}
+	}
+	return "", "", false
 }
 
 // captureSpecs resolves the configured sources, falling back to the default
