@@ -59,6 +59,14 @@ a meeting, and tame large pasted documents.
   (`LibraryService.CondenseContext`), preserving names/acronyms/dates/decisions and
   stripping redundancy. Result is shown as a **before/after preview** the user
   accepts or discards — the saved notes are never silently rewritten.
+- ✅ **Stable topic titles** — the engine no longer adopts a reworded title on every
+  pass. When the model reports `topicChanged:false` the established title is kept
+  verbatim (summary/assertions still update); only a flagged change re-titles and
+  archives. Prompt strengthened to reuse the prior title exactly and to treat a
+  subject as one continuing topic. Side benefit: topic-scoped live notes (keyed on
+  the title) no longer expire spuriously when the model paraphrases.
+- ✅ Idle setup strip uses a **complementary amber accent** so it stands out from the
+  violet primary and neutral tiles.
 
 ## Test coverage
 Full suite passes with cgo enabled (`go test ./internal/... .`) and clean under `-race`:

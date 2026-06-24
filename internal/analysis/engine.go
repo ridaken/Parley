@@ -263,8 +263,16 @@ func (e *Engine) analyze(ctx context.Context, window, prevTitle string, notes []
 		}
 		e.dropTopicNotesLocked() // topic-scoped corrections expire with their topic
 	}
+	// Keep the established title stable while the discussion stays on the same
+	// subject. The model tends to paraphrase an unchanged topic on every pass,
+	// which churns the UI (and would wrongly expire topic-scoped notes keyed on
+	// the title). Only adopt the model's new title when it flags a real change.
+	title := res.CurrentTopicTitle
+	if !res.TopicChanged && e.state.Current.Title != "" {
+		title = e.state.Current.Title
+	}
 	e.state.Current = Topic{
-		Title:      res.CurrentTopicTitle,
+		Title:      title,
 		Summary:    res.CurrentTopicSummary,
 		Assertions: res.Assertions,
 	}
@@ -349,7 +357,9 @@ func orNone(s string) string {
 
 const systemPrompt = `You monitor a live meeting transcript and maintain structured notes for the listener.
 Respond with ONLY a single minified JSON object (no markdown, no prose) of this shape:
-{"currentTopicTitle": string, "currentTopicSummary": string (1-2 sentences), "topicChanged": boolean (true only if the current topic clearly differs from the PREVIOUS TOPIC TITLE provided), "assertions": [{"speaker": string (use the speaker label exactly as it appears in the transcript), "text": string}], "suggestions": [{"kind": "question"|"clarification", "text": string}]}.
+{"currentTopicTitle": string, "currentTopicSummary": string (1-2 sentences), "topicChanged": boolean, "assertions": [{"speaker": string (use the speaker label exactly as it appears in the transcript), "text": string}], "suggestions": [{"kind": "question"|"clarification", "text": string}]}.
+- topicChanged: set true ONLY when the discussion has genuinely moved to a different subject than the PREVIOUS TOPIC TITLE. While the conversation is still about that subject — even as new points, details, or sub-points come up — set it false. A topic spans the whole discussion of a subject, not each individual statement; do not split a continuing discussion into many topics.
+- currentTopicTitle: when topicChanged is false, reuse the PREVIOUS TOPIC TITLE EXACTLY as given — do not reword, rephrase, shorten, or "improve" it. Only write a new title when topicChanged is true.
 - assertions: the key claims/points/decisions stated about the current topic (max 6, most recent/important first).
 - suggestions: sharp questions the listener could ask right now, or things that need clarification (max 4).
 Be concise and specific. If the transcript is too sparse to tell, use an empty array and a best-effort title.`

@@ -387,8 +387,8 @@ function App() {
       )}
 
       {!running && !loaded && (
-        <div className="flex items-center gap-2 border-b bg-muted/40 px-5 py-2 text-sm">
-          <NotebookPen className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-sm">
+          <NotebookPen className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
           {activeContext ? (
             <span className="min-w-0 truncate text-muted-foreground">
               Meeting context:{" "}
@@ -404,7 +404,7 @@ function App() {
           <Button
             size="sm"
             variant="outline"
-            className="ml-auto"
+            className="ml-auto border-amber-500/40 hover:bg-amber-500/15"
             onClick={() => setContextOpen(true)}
           >
             {activeContext ? "Change context" : "Set up context"}
