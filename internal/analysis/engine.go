@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,21 @@ type Context struct {
 	Notes   string
 }
 
+// Note scopes for live, mid-meeting context.
+const (
+	ScopeMeeting = "meeting" // applies for the whole session
+	ScopeTopic   = "topic"   // applies only while its topic is current
+)
+
+// LiveNote is context the user injects during the meeting. Meeting-scoped notes
+// (names, themes, standing corrections) ride along on every analysis; topic-scoped
+// notes correct the immediate discussion and expire when the topic changes.
+type LiveNote struct {
+	Scope      string
+	TopicTitle string // topic active when a topic-scoped note was added
+	Text       string
+}
+
 const (
 	maxTranscriptLines = 600
 	promptWindowLines  = 60
@@ -69,6 +85,7 @@ type Engine struct {
 	transcript  []line
 	state       State
 	analyzedLen int
+	liveNotes   []LiveNote
 
 	busy   atomic.Bool
 	cancel context.CancelFunc
@@ -95,6 +112,44 @@ func (e *Engine) Feed(speaker, text string) {
 		e.transcript = e.transcript[len(e.transcript)-maxTranscriptLines:]
 	}
 	e.mu.Unlock()
+}
+
+// AddLiveNote records a live context note. For topic-scoped notes it tags the
+// note with the current topic title (so it can expire on the next topic change)
+// and returns the stored note so the caller can persist/display it.
+func (e *Engine) AddLiveNote(scope, text string) LiveNote {
+	text = strings.TrimSpace(text)
+	if scope != ScopeMeeting {
+		scope = ScopeTopic
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n := LiveNote{Scope: scope, Text: text}
+	if scope == ScopeTopic {
+		n.TopicTitle = e.state.Current.Title
+	}
+	if text != "" {
+		e.liveNotes = append(e.liveNotes, n)
+	}
+	return n
+}
+
+// Restore seeds the engine from a previously saved session so analysis resumes
+// where it left off: prior insight is shown immediately and re-feeding history
+// is avoided (analyzedLen is advanced past the restored transcript).
+func (e *Engine) Restore(state State, notes []LiveNote, transcript []struct{ Speaker, Text string }) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.state = state
+	e.liveNotes = notes
+	e.transcript = e.transcript[:0]
+	for _, h := range transcript {
+		e.transcript = append(e.transcript, line{speaker: h.Speaker, text: h.Text})
+	}
+	if len(e.transcript) > maxTranscriptLines {
+		e.transcript = e.transcript[len(e.transcript)-maxTranscriptLines:]
+	}
+	e.analyzedLen = len(e.transcript)
 }
 
 // Start begins the analysis loop.
@@ -138,14 +193,29 @@ func (e *Engine) maybeAnalyze(ctx context.Context) {
 	}
 	window := e.recentWindowLocked()
 	prevTitle := e.state.Current.Title
+	notes := e.liveNotesForPromptLocked()
 	e.analyzedLen = len(e.transcript)
 	e.mu.Unlock()
 
 	e.busy.Store(true)
 	go func() {
 		defer e.busy.Store(false)
-		e.analyze(ctx, window, prevTitle)
+		e.analyze(ctx, window, prevTitle, notes)
 	}()
+}
+
+// liveNotesForPromptLocked returns the notes currently in effect: all
+// meeting-scoped notes plus any topic-scoped notes whose topic is still current.
+func (e *Engine) liveNotesForPromptLocked() []LiveNote {
+	cur := e.state.Current.Title
+	out := make([]LiveNote, 0, len(e.liveNotes))
+	for _, n := range e.liveNotes {
+		if n.Scope == ScopeTopic && !strings.EqualFold(n.TopicTitle, cur) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 func (e *Engine) recentWindowLocked() string {
@@ -168,19 +238,19 @@ type llmResult struct {
 	Suggestions         []Suggestion `json:"suggestions"`
 }
 
-func (e *Engine) analyze(ctx context.Context, window, prevTitle string) {
+func (e *Engine) analyze(ctx context.Context, window, prevTitle string, notes []LiveNote) {
 	messages := []llm.Message{
 		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: e.buildUserPrompt(window, prevTitle)},
+		{Role: "user", Content: e.buildUserPrompt(window, prevTitle, notes)},
 	}
 	reply, err := e.client.Complete(ctx, messages)
 	if err != nil {
-		fmt.Printf("[analysis] llm error: %v\n", err)
+		log.Printf("[analysis] llm error: %v", err)
 		return
 	}
 	res, err := parseResult(reply)
 	if err != nil {
-		fmt.Printf("[analysis] parse error: %v (reply: %.200q)\n", err, reply)
+		log.Printf("[analysis] parse error: %v (reply: %.200q)", err, reply)
 		return
 	}
 
@@ -191,6 +261,7 @@ func (e *Engine) analyze(ctx context.Context, window, prevTitle string) {
 		if len(e.state.Past) > maxPastTopics {
 			e.state.Past = e.state.Past[len(e.state.Past)-maxPastTopics:]
 		}
+		e.dropTopicNotesLocked() // topic-scoped corrections expire with their topic
 	}
 	e.state.Current = Topic{
 		Title:      res.CurrentTopicTitle,
@@ -206,13 +277,26 @@ func (e *Engine) analyze(ctx context.Context, window, prevTitle string) {
 	}
 }
 
+// dropTopicNotesLocked removes all topic-scoped live notes, keeping meeting-scoped
+// ones. Called when the topic rolls over so stale corrections can't mislead the
+// model about the new topic.
+func (e *Engine) dropTopicNotesLocked() {
+	kept := e.liveNotes[:0]
+	for _, n := range e.liveNotes {
+		if n.Scope == ScopeMeeting {
+			kept = append(kept, n)
+		}
+	}
+	e.liveNotes = kept
+}
+
 func (e *Engine) cloneStateLocked() State {
 	past := make([]Topic, len(e.state.Past))
 	copy(past, e.state.Past)
 	return State{Current: e.state.Current, Past: past, Suggestions: e.state.Suggestions}
 }
 
-func (e *Engine) buildUserPrompt(window, prevTitle string) string {
+func (e *Engine) buildUserPrompt(window, prevTitle string, notes []LiveNote) string {
 	var b strings.Builder
 	b.WriteString("MEETING CONTEXT\n")
 	if e.bg.Summary != "" {
@@ -227,6 +311,28 @@ func (e *Engine) buildUserPrompt(window, prevTitle string) string {
 	if e.bg.Summary == "" && e.bg.People == "" && e.bg.Notes == "" {
 		b.WriteString("(none provided)\n")
 	}
+
+	var standing, topical []string
+	for _, n := range notes {
+		if n.Scope == ScopeMeeting {
+			standing = append(standing, n.Text)
+		} else {
+			topical = append(topical, n.Text)
+		}
+	}
+	if len(standing) > 0 {
+		b.WriteString("\nSTANDING CORRECTIONS (provided live by the listener; apply to the whole meeting — e.g. correct names, acronyms, themes):\n")
+		for _, t := range standing {
+			fmt.Fprintf(&b, "- %s\n", t)
+		}
+	}
+	if len(topical) > 0 {
+		b.WriteString("\nNOTE ON CURRENT TOPIC (provided live by the listener; corrects the immediate discussion only — trust over the transcript if they conflict):\n")
+		for _, t := range topical {
+			fmt.Fprintf(&b, "- %s\n", t)
+		}
+	}
+
 	fmt.Fprintf(&b, "\nPREVIOUS TOPIC TITLE: %s\n", orNone(prevTitle))
 	b.WriteString("\nRECENT TRANSCRIPT. Speaker labels: \"You\" = the listener; \"Others\" = remote/other participants; \"Room\" = an in-person/mixed capture where individuals (possibly including the listener) are not separable:\n")
 	b.WriteString(window)

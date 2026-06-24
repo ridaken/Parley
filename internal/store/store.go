@@ -34,6 +34,12 @@ type Settings struct {
 	ActiveProfileID     int64           `json:"activeProfileID"`
 	HasAPIKey           bool            `json:"hasAPIKey"`
 	CaptureSources      []CaptureSource `json:"captureSources"`
+	// SttBaseURL, when set, points transcription at a remote whisper.cpp-compatible
+	// server (e.g. http://host:8765) instead of launching the bundled engine.
+	SttBaseURL string `json:"sttBaseURL"`
+	// WhisperModel is the model filename under resources/whisper/models used by the
+	// bundled engine. A small model (e.g. ggml-base.en.bin) keeps CPU use light.
+	WhisperModel string `json:"whisperModel"`
 }
 
 // Profile is reusable context the user supplies to ground the analysis.
@@ -86,12 +92,49 @@ CREATE TABLE IF NOT EXISTS profiles (
   people     TEXT NOT NULL DEFAULT '',
   notes      TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT ''
-);`)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  title         TEXT NOT NULL DEFAULT '',
+  started_at    TEXT NOT NULL DEFAULT '',
+  ended_at      TEXT NOT NULL DEFAULT '',
+  profile_id    INTEGER NOT NULL DEFAULT 0,
+  audio_dir     TEXT NOT NULL DEFAULT '',
+  analysis_json TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS transcript_segments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  seq        INTEGER NOT NULL,
+  source     TEXT    NOT NULL,
+  text       TEXT    NOT NULL,
+  start_ms   INTEGER NOT NULL,
+  end_ms     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_segments_session ON transcript_segments(session_id, seq);
+
+CREATE TABLE IF NOT EXISTS live_notes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  INTEGER NOT NULL,
+  scope       TEXT    NOT NULL,          -- 'meeting' | 'topic'
+  topic_title TEXT    NOT NULL DEFAULT '',
+  text        TEXT    NOT NULL,
+  created_at  TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_live_notes_session ON live_notes(session_id);`)
 	if err != nil {
 		return err
 	}
 	// Added after initial release — tolerate pre-existing databases.
-	return s.addColumn("settings", "capture_sources", "TEXT NOT NULL DEFAULT '[]'")
+	if err := s.addColumn("settings", "capture_sources", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.addColumn("settings", "stt_base_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return s.addColumn("settings", "whisper_model", "TEXT NOT NULL DEFAULT 'ggml-base.en.bin'")
 }
 
 // addColumn adds a column, ignoring the error if it already exists.
@@ -107,9 +150,12 @@ func (s *Store) addColumn(table, column, decl string) error {
 func (s *Store) GetSettings() (Settings, error) {
 	var st Settings
 	var sourcesJSON string
-	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, active_profile_id, capture_sources FROM settings WHERE id = 1`)
-	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.ActiveProfileID, &sourcesJSON); err != nil {
+	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, active_profile_id, capture_sources, stt_base_url, whisper_model FROM settings WHERE id = 1`)
+	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.ActiveProfileID, &sourcesJSON, &st.SttBaseURL, &st.WhisperModel); err != nil {
 		return Settings{}, err
+	}
+	if st.WhisperModel == "" {
+		st.WhisperModel = "ggml-base.en.bin"
 	}
 	st.CaptureSources = []CaptureSource{}
 	if sourcesJSON != "" {
@@ -132,8 +178,8 @@ func (s *Store) SaveSettings(st Settings) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, active_profile_id = ?, capture_sources = ? WHERE id = 1`,
-		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.ActiveProfileID, string(sourcesJSON),
+		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, active_profile_id = ?, capture_sources = ?, stt_base_url = ?, whisper_model = ? WHERE id = 1`,
+		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.ActiveProfileID, string(sourcesJSON), st.SttBaseURL, st.WhisperModel,
 	)
 	return err
 }

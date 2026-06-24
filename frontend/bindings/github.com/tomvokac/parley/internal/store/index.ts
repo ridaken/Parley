@@ -3,6 +3,8 @@
 
 export type {
     CaptureSource,
+    LiveNote,
     Profile,
+    Session,
     Settings
 } from "./models.js";

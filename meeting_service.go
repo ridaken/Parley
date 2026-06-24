@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -43,9 +46,20 @@ type MeetingService struct {
 	server   *stt.Server
 	engine   *analysis.Engine
 
+	sessionID atomic.Int64 // active session row; 0 when not persisting
+
 	recMu      sync.Mutex
 	recorders  map[audio.Source]*audio.MonoWAVWriter
 	sessionDir string
+}
+
+// LoadedSession is a saved meeting's full state, returned to the frontend so it
+// can repopulate the transcript and analysis panels (read-only view or resume).
+type LoadedSession struct {
+	Session   store.Session    `json:"session"`
+	Segments  []stt.Segment    `json:"segments"`
+	Analysis  analysis.State   `json:"analysis"`
+	LiveNotes []store.LiveNote `json:"liveNotes"`
 }
 
 // NewMeetingService constructs the service.
@@ -65,8 +79,17 @@ func (m *MeetingService) IsRunning() bool {
 	return m.running
 }
 
-// Start launches the whisper server, begins capture, and starts transcribing.
-func (m *MeetingService) Start() error {
+// Start launches a fresh meeting: whisper server, capture, transcription, and a
+// new persisted session.
+func (m *MeetingService) Start() error { return m.start(0) }
+
+// Resume continues a previously saved meeting, appending new transcript/analysis
+// to it. Pass the session id returned by ListSessions.
+func (m *MeetingService) Resume(id int64) error { return m.start(id) }
+
+// start launches capture+transcription. resumeID == 0 creates a new session;
+// otherwise it appends to (and rehydrates analysis from) the given session.
+func (m *MeetingService) start(resumeID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.running {
@@ -74,39 +97,52 @@ func (m *MeetingService) Start() error {
 	}
 	emitStatus("starting", "Launching transcription engine…", nil)
 
-	binPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
-	if err != nil {
-		return m.fail("whisper server binary not found", err)
-	}
-	modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", "ggml-base.en.bin"))
-	if err != nil {
-		return m.fail("whisper model not found", err)
+	settings, _ := m.store.GetSettings()
+
+	// Transcription endpoint: a configured remote whisper server, or the bundled
+	// local engine launched as a subprocess.
+	var sttURL string
+	if remote := strings.TrimSpace(settings.SttBaseURL); remote != "" {
+		log.Printf("[stt] using remote transcription server: %s", remote)
+		sttURL = strings.TrimRight(remote, "/")
+	} else {
+		binPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
+		if err != nil {
+			return m.fail("The local transcription engine isn't installed. Run \"task setup:whisper\" (or scripts/setup-whisper.ps1) to fetch it, or set a remote transcription URL in Settings.", err)
+		}
+		modelName := settings.WhisperModel
+		if modelName == "" {
+			modelName = "ggml-small.en-q5_1.bin"
+		}
+		modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
+		if err != nil {
+			return m.fail(fmt.Sprintf("Transcription model %q is missing. Run \"task setup:whisper\" to fetch it, add it under resources/whisper/models, pick another in Settings, or use a remote URL.", modelName), err)
+		}
+
+		m.server = stt.NewServer(binPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
+		if err := m.server.Start(context.Background()); err != nil {
+			return m.fail("The transcription engine didn't start. See the log file for details.", err)
+		}
+		sttURL = m.server.URL()
 	}
 
-	m.server = stt.NewServer(binPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
-	if err := m.server.Start(context.Background()); err != nil {
-		return m.fail("could not start transcription engine", err)
-	}
-
-	client := stt.NewClient(m.server.URL())
+	client := stt.NewClient(sttURL)
 	m.chunker = stt.NewChunker(client, chunkWindow, m.onSegment)
 	m.chunker.Start()
 
-	m.startEngine()
+	m.openSession(resumeID)
+	m.startEngine(resumeID)
 
-	m.sessionDir = filepath.Join(recordingsDir(), time.Now().Format("2006-01-02_15-04-05"))
-	if err := os.MkdirAll(m.sessionDir, 0o755); err != nil {
-		fmt.Printf("[rec] could not create session dir: %v\n", err)
-	}
-
+	var err error
 	m.capturer, err = audio.NewCapturer(func(src audio.Source, samples []int16) {
 		m.chunker.Feed(src, samples)
 		m.record(src, samples)
 	})
 	if err != nil {
 		m.chunker.Stop()
-		m.server.Stop()
-		return m.fail("could not initialise audio", err)
+		m.stopServer()
+		m.closeSession()
+		return m.fail("Couldn't access the audio system on this machine.", err)
 	}
 	if err := m.capturer.Start(m.captureSpecs()); err != nil {
 		m.capturer.Stop()
@@ -115,13 +151,22 @@ func (m *MeetingService) Start() error {
 			m.engine.Stop()
 			m.engine = nil
 		}
-		m.server.Stop()
-		return m.fail("could not start audio capture", err)
+		m.stopServer()
+		m.closeSession()
+		return m.fail("Couldn't start the selected audio device(s). Pick different sources in Audio settings.", err)
 	}
 
 	m.running = true
-	emitStatus("listening", "Listening", m.capturer.Active())
+	emitListening(m.capturer.Active(), m.capturer.HasMic())
 	return nil
+}
+
+// stopServer stops the local whisper subprocess if one was launched.
+func (m *MeetingService) stopServer() {
+	if m.server != nil {
+		m.server.Stop()
+		m.server = nil
+	}
 }
 
 // captureSpecs resolves the configured sources, falling back to the default
@@ -159,7 +204,7 @@ func (m *MeetingService) Stop() error {
 		m.engine.Stop()
 		m.engine = nil
 	}
-	m.server.Stop()
+	m.stopServer()
 
 	m.recMu.Lock()
 	for _, w := range m.recorders {
@@ -168,9 +213,52 @@ func (m *MeetingService) Stop() error {
 	m.recorders = make(map[audio.Source]*audio.MonoWAVWriter)
 	m.recMu.Unlock()
 
+	m.closeSession()
+
 	m.running = false
 	emitStatus("idle", "Stopped", nil)
 	return nil
+}
+
+// openSession creates (or reuses, for resume) the persisted session and the
+// on-disk audio directory for this part, recording the id for live persistence.
+func (m *MeetingService) openSession(resumeID int64) {
+	var profileID int64
+	if s, err := m.store.GetSettings(); err == nil {
+		profileID = s.ActiveProfileID
+	}
+
+	sessionID := resumeID
+	if sessionID == 0 {
+		title := "Meeting " + time.Now().Format("Jan 2 2006, 3:04 PM")
+		id, err := m.store.CreateSession(title, profileID, "")
+		if err != nil {
+			log.Printf("[session] could not create session: %v", err)
+		}
+		sessionID = id
+	}
+	m.sessionID.Store(sessionID)
+
+	// Each Start/Resume writes audio to its own part directory so resumed
+	// meetings don't clobber the earlier part's recordings.
+	root := filepath.Join(recordingsDir(), fmt.Sprintf("session-%d", sessionID))
+	if sessionID == 0 {
+		root = filepath.Join(recordingsDir(), time.Now().Format("2006-01-02_15-04-05"))
+	}
+	m.sessionDir = filepath.Join(root, time.Now().Format("part-2006-01-02_15-04-05"))
+	if err := os.MkdirAll(m.sessionDir, 0o755); err != nil {
+		log.Printf("[rec] could not create session dir: %v", err)
+	}
+	if sessionID != 0 {
+		_ = m.store.SetSessionAudioDir(sessionID, m.sessionDir)
+	}
+}
+
+// closeSession stamps the session's end time and stops live persistence.
+func (m *MeetingService) closeSession() {
+	if id := m.sessionID.Swap(0); id != 0 {
+		_ = m.store.EndSession(id, m.sessionDir)
+	}
 }
 
 // record appends samples to the per-source session WAV (created lazily).
@@ -209,6 +297,14 @@ func sanitizeFilename(s string) string {
 
 func (m *MeetingService) onSegment(seg stt.Segment) {
 	application.Get().Event.Emit("transcript", seg)
+	if id := m.sessionID.Load(); id != 0 {
+		_ = m.store.AppendSegment(id, store.Segment{
+			Source:  string(seg.Source),
+			Text:    seg.Text,
+			StartMs: seg.StartMs,
+			EndMs:   seg.EndMs,
+		})
+	}
 	if m.engine != nil {
 		m.engine.Feed(string(seg.Source), seg.Text)
 	}
@@ -216,12 +312,13 @@ func (m *MeetingService) onSegment(seg stt.Segment) {
 
 // startEngine sets up the LLM analysis engine from current settings + the active
 // context profile. If no endpoint is configured, analysis is skipped (transcript
-// still works).
-func (m *MeetingService) startEngine() {
+// still works). When resumeID != 0 it rehydrates the saved analysis state so the
+// continued meeting builds on prior topics/assertions.
+func (m *MeetingService) startEngine(resumeID int64) {
 	settings, err := m.store.GetSettings()
 	if err != nil || settings.LLMBaseURL == "" {
 		application.Get().Event.Emit("analysis", analysis.State{})
-		fmt.Println("[analysis] no LLM endpoint configured — analysis disabled")
+		log.Println("[analysis] no LLM endpoint configured — analysis disabled")
 		return
 	}
 
@@ -235,27 +332,141 @@ func (m *MeetingService) startEngine() {
 	apiKey, _ := m.store.GetAPIKey()
 	client := llm.NewClient(settings.LLMBaseURL, apiKey, settings.LLMModel)
 	interval := time.Duration(settings.AnalysisIntervalSec) * time.Second
+	sessionID := m.sessionID.Load()
 
-	application.Get().Event.Emit("analysis", analysis.State{}) // clear previous session
 	m.engine = analysis.NewEngine(client, interval, bg, func(s analysis.State) {
 		application.Get().Event.Emit("analysis", s)
+		if sessionID != 0 {
+			if data, err := json.Marshal(s); err == nil {
+				_ = m.store.SaveAnalysis(sessionID, string(data))
+			}
+		}
 	})
+
+	if resumeID != 0 {
+		m.restoreEngine(resumeID)
+	} else {
+		application.Get().Event.Emit("analysis", analysis.State{}) // clear previous session
+	}
 	m.engine.Start()
 }
 
+// restoreEngine seeds the engine from a saved session and re-emits its analysis
+// so the panels populate immediately on resume.
+func (m *MeetingService) restoreEngine(id int64) {
+	b, err := m.store.GetSessionBundle(id)
+	if err != nil {
+		log.Printf("[analysis] resume load failed: %v", err)
+		return
+	}
+	var st analysis.State
+	if b.AnalysisJSON != "" {
+		_ = json.Unmarshal([]byte(b.AnalysisJSON), &st)
+	}
+	notes := make([]analysis.LiveNote, 0, len(b.LiveNotes))
+	for _, n := range b.LiveNotes {
+		notes = append(notes, analysis.LiveNote{Scope: n.Scope, TopicTitle: n.TopicTitle, Text: n.Text})
+	}
+	history := make([]struct{ Speaker, Text string }, 0, len(b.Segments))
+	for _, s := range b.Segments {
+		history = append(history, struct{ Speaker, Text string }{Speaker: s.Source, Text: s.Text})
+	}
+	m.engine.Restore(st, notes, history)
+	application.Get().Event.Emit("analysis", st)
+}
+
+// AddLiveNote injects user context mid-meeting. scope is "meeting" (whole
+// session) or "topic" (current topic only); it is fed to the analysis engine and
+// persisted with the session.
+func (m *MeetingService) AddLiveNote(scope, text string) (store.LiveNote, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return store.LiveNote{}, nil
+	}
+
+	m.mu.Lock()
+	eng := m.engine
+	m.mu.Unlock()
+
+	note := store.LiveNote{Scope: scope, Text: text}
+	if note.Scope != analysis.ScopeMeeting {
+		note.Scope = analysis.ScopeTopic
+	}
+	if eng != nil {
+		applied := eng.AddLiveNote(scope, text)
+		note.Scope = applied.Scope
+		note.TopicTitle = applied.TopicTitle
+	}
+
+	if id := m.sessionID.Load(); id != 0 {
+		return m.store.AddLiveNote(id, note)
+	}
+	return note, nil
+}
+
+// ListSessions returns saved meetings, newest first.
+func (m *MeetingService) ListSessions() ([]store.Session, error) {
+	return m.store.ListSessions()
+}
+
+// LoadSession returns a saved meeting's full state for display.
+func (m *MeetingService) LoadSession(id int64) (LoadedSession, error) {
+	b, err := m.store.GetSessionBundle(id)
+	if err != nil {
+		return LoadedSession{}, err
+	}
+	out := LoadedSession{Session: b.Session, LiveNotes: b.LiveNotes}
+	out.Segments = make([]stt.Segment, 0, len(b.Segments))
+	for _, s := range b.Segments {
+		out.Segments = append(out.Segments, stt.Segment{
+			Source:  audio.Source(s.Source),
+			Text:    s.Text,
+			StartMs: s.StartMs,
+			EndMs:   s.EndMs,
+		})
+	}
+	if b.AnalysisJSON != "" {
+		_ = json.Unmarshal([]byte(b.AnalysisJSON), &out.Analysis)
+	}
+	return out, nil
+}
+
+// RenameSession changes a saved meeting's title.
+func (m *MeetingService) RenameSession(id int64, title string) error {
+	return m.store.SetSessionTitle(id, strings.TrimSpace(title))
+}
+
+// DeleteSession permanently removes a saved meeting (not the one in progress).
+func (m *MeetingService) DeleteSession(id int64) error {
+	if m.sessionID.Load() == id {
+		return fmt.Errorf("cannot delete the meeting that is currently recording")
+	}
+	return m.store.DeleteSession(id)
+}
+
+// fail logs the full underlying error (to the log file) and surfaces a short,
+// friendly message to the UI via the error status.
 func (m *MeetingService) fail(msg string, err error) error {
-	emitStatus("error", msg, nil)
+	log.Printf("[meeting] %s: %v", msg, err)
+	emit("error", msg, nil, false)
 	return fmt.Errorf("%s: %w", msg, err)
 }
 
-func emitStatus(state, message string, active []audio.Source) {
+// emitStatus broadcasts a state with no active sources (mic unknown).
+func emitStatus(state, message string, _ []audio.Source) {
+	emit(state, message, nil, false)
+}
+
+// emitListening broadcasts the listening state with the sources that started and
+// whether a microphone is among them.
+func emitListening(active []audio.Source, hasMic bool) {
+	emit("listening", "Listening", active, hasMic)
+}
+
+func emit(state, message string, active []audio.Source, mic bool) {
 	labels := make([]string, 0, len(active))
-	mic := false
 	for _, a := range active {
 		labels = append(labels, string(a))
-		if a == audio.You {
-			mic = true
-		}
 	}
 	if app := application.Get(); app != nil {
 		app.Event.Emit("status", StatusEvent{

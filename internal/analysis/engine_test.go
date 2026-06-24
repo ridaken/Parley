@@ -53,7 +53,7 @@ func TestEngineEmitsAnalysis(t *testing.T) {
 		}
 	})
 
-	eng.analyze(context.Background(), "Others: I think we slip to May.\n", "")
+	eng.analyze(context.Background(), "Others: I think we slip to May.\n", "", nil)
 
 	select {
 	case s := <-got:
@@ -68,6 +68,82 @@ func TestEngineEmitsAnalysis(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for analysis emit")
+	}
+}
+
+func TestLiveNoteScoping(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	eng.state.Current = Topic{Title: "Pricing"}
+
+	eng.AddLiveNote(ScopeMeeting, "Client is Acme")
+	eng.AddLiveNote(ScopeTopic, "Topic is margins, not revenue")
+
+	// Both notes apply while "Pricing" is current.
+	prompt := eng.buildUserPrompt("You: hi\n", "", eng.snapshotNotes())
+	if !contains(prompt, "Acme") || !contains(prompt, "margins") {
+		t.Fatalf("expected both notes in prompt:\n%s", prompt)
+	}
+
+	// Simulate a topic change: topic-scoped notes must expire, meeting ones stay.
+	eng.mu.Lock()
+	eng.dropTopicNotesLocked()
+	eng.state.Current = Topic{Title: "Timeline"}
+	eng.mu.Unlock()
+
+	prompt = eng.buildUserPrompt("You: hi\n", "Pricing", eng.snapshotNotes())
+	if !contains(prompt, "Acme") {
+		t.Fatalf("meeting note should persist:\n%s", prompt)
+	}
+	if contains(prompt, "margins") {
+		t.Fatalf("topic note should have expired:\n%s", prompt)
+	}
+}
+
+func (e *Engine) snapshotNotes() []LiveNote {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.liveNotesForPromptLocked()
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRestoreSeedsStateWithoutReanalyzing(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+
+	state := State{
+		Current: Topic{Title: "Budget", Summary: "Q3 numbers"},
+		Past:    []Topic{{Title: "Intro"}},
+	}
+	notes := []LiveNote{
+		{Scope: ScopeMeeting, Text: "Client is Acme"},
+		{Scope: ScopeTopic, TopicTitle: "Budget", Text: "focus on opex"},
+	}
+	history := []struct{ Speaker, Text string }{
+		{"You", "Let's talk budget"},
+		{"Others", "Sure"},
+	}
+
+	eng.Restore(state, notes, history)
+
+	if eng.state.Current.Title != "Budget" || len(eng.state.Past) != 1 {
+		t.Fatalf("state not restored: %+v", eng.state)
+	}
+	// analyzedLen must equal the restored transcript length so the next tick does
+	// not regenerate topics already present (no new content yet).
+	if eng.analyzedLen != len(history) || len(eng.transcript) != len(history) {
+		t.Fatalf("analyzedLen=%d transcript=%d, want %d", eng.analyzedLen, len(eng.transcript), len(history))
+	}
+	// Both notes are in effect while "Budget" is current.
+	prompt := eng.buildUserPrompt("You: hi\n", "", eng.snapshotNotes())
+	if !contains(prompt, "Acme") || !contains(prompt, "opex") {
+		t.Fatalf("restored notes missing from prompt:\n%s", prompt)
 	}
 }
 
@@ -90,10 +166,10 @@ func TestEngineArchivesPastTopic(t *testing.T) {
 	done := make(chan State, 2)
 	eng := NewEngine(client, 3*time.Second, Context{}, func(s State) { done <- s })
 
-	eng.analyze(context.Background(), "Others: line one\n", "")
+	eng.analyze(context.Background(), "Others: line one\n", "", nil)
 	<-done // Topic A
 
-	eng.analyze(context.Background(), "Others: line two\n", "Topic A")
+	eng.analyze(context.Background(), "Others: line two\n", "Topic A", nil)
 	s := <-done // Topic B, A archived
 
 	if s.Current.Title != "Topic B" {

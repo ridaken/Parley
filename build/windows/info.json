@@ -7,9 +7,9 @@
 			"ProductVersion": "0.1.0",
 			"CompanyName": "Vokac",
 			"FileDescription": "Local-first meeting assistant",
-			"LegalCopyright": "© 2026, My Company",
+			"LegalCopyright": "© 2026 Tom Vokac",
 			"ProductName": "Parley",
-			"Comments": "This is a comment"
+			"Comments": "Local-first meeting assistant"
 		}
 	}
 }
