@@ -47,6 +47,19 @@ Save and load full meeting state so multi-part meetings persist.
   already-cancelled context (silently dropped, up to ~5s of audio lost). Fixed: the final
   flush runs on a fresh context and waits for its transcription before tearing down.
 
+## Phase 2.9 — Pre-meeting context polish ✅ *(new)*
+Make the existing context-profile system the obvious place to prep the LLM before
+a meeting, and tame large pasted documents.
+- ✅ **Idle setup strip** in `App.tsx`: when idle (not recording, not viewing a
+  saved meeting) it shows the active context profile — or a "no context set"
+  prompt — with a button into the context editor, so background is set *before*
+  Start instead of only via the unlabeled header icon.
+- ✅ **Condense with AI** in `ContextDialog`: an opt-in button shrinks the free-form
+  notes (where pasted docs land) via the **active LLM connection**
+  (`LibraryService.CondenseContext`), preserving names/acronyms/dates/decisions and
+  stripping redundancy. Result is shown as a **before/after preview** the user
+  accepts or discards — the saved notes are never silently rewritten.
+
 ## Test coverage
 Full suite passes with cgo enabled (`go test ./internal/... .`) and clean under `-race`:
 - `store`: settings, profile CRUD, **session save/load/delete round-trip**.

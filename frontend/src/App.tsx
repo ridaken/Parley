@@ -105,7 +105,26 @@ function App() {
   const [micConfigured, setMicConfigured] = useState(true);
   const [conns, setConns] = useState<LLMConnection[]>([]);
   const [activeConnId, setActiveConnId] = useState<number>(0);
+  const [activeContext, setActiveContext] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // Name of the context profile that will ground the next meeting (null = none
+  // selected), so the idle setup strip can show whether the LLM has background.
+  const refreshContext = () => {
+    Promise.all([LibraryService.ListProfiles(), LibraryService.GetSettings()])
+      .then(([list, s]) => {
+        const id = s?.activeProfileID ?? 0;
+        const p = id ? (list ?? []).find((x) => x.id === id) : undefined;
+        setActiveContext(p?.name ?? null);
+      })
+      .catch(() => {});
+  };
+
+  // Refresh on mount and whenever the context dialog closes (the active profile
+  // or its name may have changed).
+  useEffect(() => {
+    if (!contextOpen) refreshContext();
+  }, [contextOpen]);
 
   // Saved LLM connections + the active one, so the header switcher reflects the
   // current provider and changes apply to the next meeting started.
@@ -363,6 +382,32 @@ function App() {
             onClick={clearLoaded}
           >
             <X className="h-4 w-4" /> New meeting
+          </Button>
+        </div>
+      )}
+
+      {!running && !loaded && (
+        <div className="flex items-center gap-2 border-b bg-muted/40 px-5 py-2 text-sm">
+          <NotebookPen className="h-4 w-4 shrink-0 text-muted-foreground" />
+          {activeContext ? (
+            <span className="min-w-0 truncate text-muted-foreground">
+              Meeting context:{" "}
+              <span className="font-medium text-foreground">{activeContext}</span>{" "}
+              — the assistant will use this as background.
+            </span>
+          ) : (
+            <span className="min-w-0 truncate text-muted-foreground">
+              No meeting context set. Give the assistant background — attendees,
+              agenda, docs — before you start.
+            </span>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-auto"
+            onClick={() => setContextOpen(true)}
+          >
+            {activeContext ? "Change context" : "Set up context"}
           </Button>
         </div>
       )}
