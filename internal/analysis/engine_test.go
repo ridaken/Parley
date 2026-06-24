@@ -31,6 +31,22 @@ func TestParseResult(t *testing.T) {
 	}
 }
 
+func TestParseResultRejectsBadReplies(t *testing.T) {
+	cases := map[string]string{
+		"empty":         "",
+		"no braces":     "I'm not sure how to answer that.",
+		"closing first": "}{ broken",
+		"invalid json":  "here you go: {not: valid, json}",
+	}
+	for name, reply := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseResult(reply); err == nil {
+				t.Fatalf("reply %q: expected an error, got nil", reply)
+			}
+		})
+	}
+}
+
 func TestEngineEmitsAnalysis(t *testing.T) {
 	// Mock OpenAI-compatible endpoint returning a fixed analysis JSON.
 	content := `{"currentTopicTitle":"Project timeline","currentTopicSummary":"Discussing the launch date.","topicChanged":false,"assertions":[{"speaker":"Others","text":"We slip to May."}],"suggestions":[{"kind":"clarification","text":"Which features are cut?"}]}`
