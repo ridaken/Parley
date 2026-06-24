@@ -2,6 +2,37 @@ package store
 
 import "testing"
 
+func TestSessionSettersAndGetProfile(t *testing.T) {
+	s := openTemp(t)
+
+	id, err := s.CreateSession("Initial", 0, "")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.SetSessionTitle(id, "Renamed"); err != nil {
+		t.Fatalf("SetSessionTitle: %v", err)
+	}
+	if err := s.SetSessionAudioDir(id, "/tmp/audio/x"); err != nil {
+		t.Fatalf("SetSessionAudioDir: %v", err)
+	}
+	b, err := s.GetSessionBundle(id)
+	if err != nil {
+		t.Fatalf("GetSessionBundle: %v", err)
+	}
+	if b.Session.Title != "Renamed" || b.Session.AudioDir != "/tmp/audio/x" {
+		t.Fatalf("setters not persisted: %+v", b.Session)
+	}
+
+	p, err := s.SaveProfile(Profile{Name: "Team", Summary: "weekly sync"})
+	if err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	got, err := s.GetProfile(p.ID)
+	if err != nil || got.Name != "Team" || got.Summary != "weekly sync" {
+		t.Fatalf("GetProfile = %+v (%v)", got, err)
+	}
+}
+
 func TestSessionRoundTrip(t *testing.T) {
 	s := openTemp(t)
 

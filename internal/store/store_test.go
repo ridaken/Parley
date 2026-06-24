@@ -3,6 +3,8 @@ package store
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/zalando/go-keyring"
 )
 
 func TestSettingsDefaultsAndUpdate(t *testing.T) {
@@ -62,6 +64,9 @@ func TestProfileCRUD(t *testing.T) {
 
 func openTemp(t *testing.T) *Store {
 	t.Helper()
+	// Use an in-memory keychain, reset per test, so API-key paths don't touch
+	// (or depend on) the real OS keychain and don't leak keys across tests.
+	keyring.MockInit()
 	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)

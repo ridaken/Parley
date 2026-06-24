@@ -316,9 +316,15 @@ func (m *MeetingService) onSegment(seg stt.Segment) {
 // continued meeting builds on prior topics/assertions.
 func (m *MeetingService) startEngine(resumeID int64) {
 	settings, err := m.store.GetSettings()
-	if err != nil || settings.LLMBaseURL == "" {
+	if err != nil {
 		application.Get().Event.Emit("analysis", analysis.State{})
-		log.Println("[analysis] no LLM endpoint configured — analysis disabled")
+		log.Printf("[analysis] could not load settings — analysis disabled: %v", err)
+		return
+	}
+	conn, err := m.store.GetActiveLLMConnection()
+	if err != nil || conn.BaseURL == "" {
+		application.Get().Event.Emit("analysis", analysis.State{})
+		log.Println("[analysis] no LLM connection configured — analysis disabled")
 		return
 	}
 
@@ -329,8 +335,9 @@ func (m *MeetingService) startEngine(resumeID int64) {
 		}
 	}
 
-	apiKey, _ := m.store.GetAPIKey()
-	client := llm.NewClient(settings.LLMBaseURL, apiKey, settings.LLMModel)
+	apiKey, _ := m.store.GetConnectionAPIKey(conn.ID)
+	log.Printf("[analysis] using LLM connection %q (%s, model %s)", conn.Name, conn.BaseURL, conn.Model)
+	client := llm.NewClient(conn.BaseURL, apiKey, conn.Model)
 	interval := time.Duration(settings.AnalysisIntervalSec) * time.Second
 	sessionID := m.sessionID.Load()
 

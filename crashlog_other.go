@@ -10,3 +10,7 @@ import "os"
 func redirectStderr(f *os.File) {
 	os.Stderr = f
 }
+
+// hideOwnedConsole is a no-op off Windows (the stray-console problem is
+// Windows-specific). Defined so main.go can call it unconditionally.
+func hideOwnedConsole() {}

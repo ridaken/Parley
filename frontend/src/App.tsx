@@ -16,11 +16,18 @@ import { MeetingService, LibraryService } from "../bindings/github.com/tomvokac/
 import type { StatusEvent } from "../bindings/github.com/tomvokac/parley";
 import type { Segment } from "../bindings/github.com/tomvokac/parley/internal/stt/models";
 import type { State as AnalysisState } from "../bindings/github.com/tomvokac/parley/internal/analysis/models";
-import type { LiveNote } from "../bindings/github.com/tomvokac/parley/internal/store/models";
+import type { LiveNote, LLMConnection } from "../bindings/github.com/tomvokac/parley/internal/store/models";
 import type { LoadedSession } from "../bindings/github.com/tomvokac/parley/models";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -96,7 +103,30 @@ function App() {
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loaded, setLoaded] = useState<{ id: number; title: string } | null>(null);
   const [micConfigured, setMicConfigured] = useState(true);
+  const [conns, setConns] = useState<LLMConnection[]>([]);
+  const [activeConnId, setActiveConnId] = useState<number>(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // Saved LLM connections + the active one, so the header switcher reflects the
+  // current provider and changes apply to the next meeting started.
+  const refreshConnections = () => {
+    Promise.all([LibraryService.ListLLMConnections(), LibraryService.GetSettings()])
+      .then(([c, s]) => {
+        setConns(c ?? []);
+        setActiveConnId(s?.activeLLMConnectionID ?? 0);
+      })
+      .catch(() => {});
+  };
+
+  // Refresh on mount and whenever Settings closes (connections may have changed).
+  useEffect(() => {
+    if (!settingsOpen) refreshConnections();
+  }, [settingsOpen]);
+
+  const pickConnection = (id: number) => {
+    setActiveConnId(id);
+    LibraryService.SetActiveLLMConnection(id).catch(() => {});
+  };
 
   // Reflect whether a microphone is configured (or defaulted) so the header is
   // meaningful before a session starts. Empty config = default mic + system audio.
@@ -248,6 +278,32 @@ function App() {
           >
             <NotebookPen className="h-4 w-4" />
           </Button>
+          {conns.length > 0 && (
+            <Select
+              value={activeConnId ? String(activeConnId) : undefined}
+              onValueChange={(v) => pickConnection(Number(v))}
+              disabled={running}
+            >
+              <SelectTrigger
+                className="h-8 w-[150px] text-xs"
+                title={
+                  running
+                    ? "Stop the meeting to switch LLM connection"
+                    : "LLM connection used for analysis"
+                }
+              >
+                <SelectValue placeholder="LLM connection" />
+              </SelectTrigger>
+              <SelectContent>
+                {conns.map((c) => (
+                  <SelectItem key={c.id} value={String(c.id)}>
+                    {c.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+
           <Button
             variant="ghost"
             size="icon"

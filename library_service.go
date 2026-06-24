@@ -34,17 +34,56 @@ func (l *LibraryService) SetAPIKey(key string) error {
 	return l.store.SetAPIKey(key)
 }
 
-// TestConnection verifies the configured LLM endpoint/model/key respond.
+// TestConnection verifies the active LLM connection's endpoint/model/key respond.
 func (l *LibraryService) TestConnection() error {
-	s, err := l.store.GetSettings()
+	conn, err := l.store.GetActiveLLMConnection()
 	if err != nil {
 		return err
 	}
-	if s.LLMBaseURL == "" {
+	return l.testConn(conn)
+}
+
+// ListLLMConnections returns all saved LLM connections (newest-updated first).
+func (l *LibraryService) ListLLMConnections() ([]store.LLMConnection, error) {
+	return l.store.ListLLMConnections()
+}
+
+// SaveLLMConnection inserts or updates a connection and returns the saved row.
+func (l *LibraryService) SaveLLMConnection(c store.LLMConnection) (store.LLMConnection, error) {
+	return l.store.SaveLLMConnection(c)
+}
+
+// DeleteLLMConnection removes a connection (and its stored key).
+func (l *LibraryService) DeleteLLMConnection(id int64) error {
+	return l.store.DeleteLLMConnection(id)
+}
+
+// SetActiveLLMConnection selects which connection drives analysis.
+func (l *LibraryService) SetActiveLLMConnection(id int64) error {
+	return l.store.SetActiveLLMConnection(id)
+}
+
+// SetConnectionAPIKey stores or clears a connection's API key in the keychain.
+func (l *LibraryService) SetConnectionAPIKey(id int64, key string) error {
+	return l.store.SetConnectionAPIKey(id, key)
+}
+
+// TestLLMConnection verifies a specific saved connection responds. The UI saves
+// edits (and key) before calling this, so it tests the persisted values.
+func (l *LibraryService) TestLLMConnection(id int64) error {
+	conn, err := l.store.GetLLMConnection(id)
+	if err != nil {
+		return err
+	}
+	return l.testConn(conn)
+}
+
+func (l *LibraryService) testConn(conn store.LLMConnection) error {
+	if conn.BaseURL == "" {
 		return fmt.Errorf("no LLM endpoint configured")
 	}
-	key, _ := l.store.GetAPIKey()
-	client := llm.NewClient(s.LLMBaseURL, key, s.LLMModel)
+	key, _ := l.store.GetConnectionAPIKey(conn.ID)
+	client := llm.NewClient(conn.BaseURL, key, conn.Model)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return client.Ping(ctx)

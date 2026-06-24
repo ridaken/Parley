@@ -61,6 +61,31 @@ func TestCompleteSurfacesAPIError(t *testing.T) {
 	}
 }
 
+func TestPingSucceedsOnHealthyEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "pong"}}},
+		})
+	}))
+	defer srv.Close()
+
+	if err := NewClient(srv.URL, "", "m").Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+}
+
+func TestPingSurfacesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer srv.Close()
+
+	if err := NewClient(srv.URL, "", "m").Ping(context.Background()); err == nil {
+		t.Fatal("expected Ping to surface a server error")
+	}
+}
+
 func TestBaseURLTrimsTrailingSlash(t *testing.T) {
 	c := NewClient("http://x/v1/", "", "m")
 	if c.baseURL != "http://x/v1" {

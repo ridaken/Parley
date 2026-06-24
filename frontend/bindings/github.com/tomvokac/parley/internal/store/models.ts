@@ -48,6 +48,19 @@ export interface LiveNote {
 }
 
 /**
+ * LLMConnection is a saved, named LLM endpoint the user can switch between.
+ * The API key is kept in the OS keychain, never in this struct.
+ */
+export interface LLMConnection {
+    "id": number;
+    "name": string;
+    "baseURL": string;
+    "model": string;
+    "hasAPIKey": boolean;
+    "updatedAt": string;
+}
+
+/**
  * Profile is reusable context the user supplies to ground the analysis.
  */
 export interface Profile {
@@ -98,4 +111,9 @@ export interface Settings {
      * bundled engine. A small model (e.g. ggml-base.en.bin) keeps CPU use light.
      */
     "whisperModel": string;
+
+    /**
+     * ActiveLLMConnectionID selects which saved LLM connection drives analysis.
+     */
+    "activeLLMConnectionID": number;
 }

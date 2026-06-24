@@ -147,6 +147,81 @@ func TestRestoreSeedsStateWithoutReanalyzing(t *testing.T) {
 	}
 }
 
+func TestFeedThenAnalyzeEmitsAndThenSkipsWithoutNewContent(t *testing.T) {
+	content := `{"currentTopicTitle":"Onboarding","currentTopicSummary":"New hire setup.","topicChanged":true,"assertions":[{"speaker":"You","text":"Need a laptop."}],"suggestions":[]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": content}}},
+		})
+	}))
+	defer srv.Close()
+
+	emits := make(chan State, 4)
+	eng := NewEngine(llm.NewClient(srv.URL, "", "m"), 3*time.Second, Context{}, func(s State) { emits <- s })
+
+	eng.Feed("You", "I need a laptop for the new hire")
+	eng.Feed("Others", "I'll order one")
+	eng.maybeAnalyze(context.Background())
+
+	select {
+	case s := <-emits:
+		if s.Current.Title != "Onboarding" {
+			t.Fatalf("title = %q", s.Current.Title)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no analysis emitted after Feed + maybeAnalyze")
+	}
+
+	// analyzedLen now equals the transcript length, so another tick with no new
+	// lines must be a no-op (avoids re-billing the LLM on a quiet meeting).
+	eng.maybeAnalyze(context.Background())
+	select {
+	case <-emits:
+		t.Fatal("unexpected re-analysis with no new content")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestFeedIgnoresBlankLines(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	eng.Feed("You", "   ")
+	eng.Feed("You", "")
+	eng.mu.Lock()
+	n := len(eng.transcript)
+	eng.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("blank lines should be dropped, transcript has %d", n)
+	}
+}
+
+func TestRecentWindowCapsAtPromptWindow(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	for i := 0; i < promptWindowLines+10; i++ {
+		eng.Feed("You", "a line of talk")
+	}
+	eng.mu.Lock()
+	window := eng.recentWindowLocked()
+	eng.mu.Unlock()
+
+	lines := 0
+	for _, r := range window {
+		if r == '\n' {
+			lines++
+		}
+	}
+	if lines != promptWindowLines {
+		t.Fatalf("window has %d lines, want %d", lines, promptWindowLines)
+	}
+}
+
+func TestStartStopIsClean(t *testing.T) {
+	// Unreachable endpoint is fine: with no transcript fed, the loop never calls
+	// the LLM. This exercises Start/loop/Stop teardown without deadlocking.
+	eng := NewEngine(llm.NewClient("http://127.0.0.1:0", "", "m"), 3*time.Second, Context{}, func(State) {})
+	eng.Start()
+	eng.Stop()
+}
+
 func TestEngineArchivesPastTopic(t *testing.T) {
 	replies := []string{
 		`{"currentTopicTitle":"Topic A","topicChanged":false,"assertions":[],"suggestions":[]}`,

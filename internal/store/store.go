@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,8 +16,17 @@ import (
 
 const (
 	keyringService = "Parley"
-	keyringUser    = "llm-api-key"
+	// keyringUser is the legacy single-connection key slot. Each LLM connection
+	// now stores its key under connKeyringUser(id); the legacy slot is migrated
+	// into the first connection on upgrade and otherwise unused.
+	keyringUser = "llm-api-key"
 )
+
+// connKeyringUser is the OS-keychain account under which a given LLM
+// connection's API key is stored, keeping every provider's key in the vault.
+func connKeyringUser(id int64) string {
+	return "llm-api-key:" + strconv.FormatInt(id, 10)
+}
 
 // CaptureSource is a user-selected audio device and the role its audio plays.
 type CaptureSource struct {
@@ -40,6 +50,20 @@ type Settings struct {
 	// WhisperModel is the model filename under resources/whisper/models used by the
 	// bundled engine. A small model (e.g. ggml-base.en.bin) keeps CPU use light.
 	WhisperModel string `json:"whisperModel"`
+	// ActiveLLMConnectionID selects which saved LLM connection drives analysis.
+	ActiveLLMConnectionID int64 `json:"activeLLMConnectionID"`
+}
+
+// LLMConnection is a saved, named LLM endpoint the user can switch between
+// (e.g. a local llama-server, a cloud provider). The API key is kept in the OS
+// keychain, never in this struct or the database.
+type LLMConnection struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"baseURL"`
+	Model     string `json:"model"`
+	HasAPIKey bool   `json:"hasAPIKey"`
+	UpdatedAt string `json:"updatedAt"`
 }
 
 // Profile is reusable context the user supplies to ground the analysis.
@@ -123,7 +147,15 @@ CREATE TABLE IF NOT EXISTS live_notes (
   text        TEXT    NOT NULL,
   created_at  TEXT    NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_live_notes_session ON live_notes(session_id);`)
+CREATE INDEX IF NOT EXISTS idx_live_notes_session ON live_notes(session_id);
+
+CREATE TABLE IF NOT EXISTS llm_connections (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL,
+  base_url   TEXT NOT NULL DEFAULT '',
+  model      TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
+);`)
 	if err != nil {
 		return err
 	}
@@ -134,7 +166,50 @@ CREATE INDEX IF NOT EXISTS idx_live_notes_session ON live_notes(session_id);`)
 	if err := s.addColumn("settings", "stt_base_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	return s.addColumn("settings", "whisper_model", "TEXT NOT NULL DEFAULT 'ggml-base.en.bin'")
+	if err := s.addColumn("settings", "whisper_model", "TEXT NOT NULL DEFAULT 'ggml-base.en.bin'"); err != nil {
+		return err
+	}
+	if err := s.addColumn("settings", "active_llm_connection_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return s.seedLLMConnections()
+}
+
+// seedLLMConnections creates the first saved LLM connection from the legacy
+// single-endpoint settings (and migrates the legacy keychain key) the first time
+// the new connections table is empty, so upgrading users keep their provider.
+func (s *Store) seedLLMConnections() error {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM llm_connections`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	var baseURL, model string
+	_ = s.db.QueryRow(`SELECT llm_base_url, llm_model FROM settings WHERE id = 1`).Scan(&baseURL, &model)
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:8080/v1"
+	}
+	if model == "" {
+		model = "local-model"
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO llm_connections (name, base_url, model, updated_at) VALUES (?, ?, ?, ?)`,
+		"Default", baseURL, model, time.Now().UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	if _, err := s.db.Exec(`UPDATE settings SET active_llm_connection_id = ? WHERE id = 1`, id); err != nil {
+		return err
+	}
+	// Carry the legacy single key over to the new per-connection slot.
+	if key, err := keyring.Get(keyringService, keyringUser); err == nil && key != "" {
+		_ = keyring.Set(keyringService, connKeyringUser(id), key)
+	}
+	return nil
 }
 
 // addColumn adds a column, ignoring the error if it already exists.
@@ -150,8 +225,8 @@ func (s *Store) addColumn(table, column, decl string) error {
 func (s *Store) GetSettings() (Settings, error) {
 	var st Settings
 	var sourcesJSON string
-	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, active_profile_id, capture_sources, stt_base_url, whisper_model FROM settings WHERE id = 1`)
-	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.ActiveProfileID, &sourcesJSON, &st.SttBaseURL, &st.WhisperModel); err != nil {
+	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, active_profile_id, capture_sources, stt_base_url, whisper_model, active_llm_connection_id FROM settings WHERE id = 1`)
+	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.ActiveProfileID, &sourcesJSON, &st.SttBaseURL, &st.WhisperModel, &st.ActiveLLMConnectionID); err != nil {
 		return Settings{}, err
 	}
 	if st.WhisperModel == "" {
@@ -178,8 +253,8 @@ func (s *Store) SaveSettings(st Settings) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, active_profile_id = ?, capture_sources = ?, stt_base_url = ?, whisper_model = ? WHERE id = 1`,
-		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.ActiveProfileID, string(sourcesJSON), st.SttBaseURL, st.WhisperModel,
+		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, active_profile_id = ?, capture_sources = ?, stt_base_url = ?, whisper_model = ?, active_llm_connection_id = ? WHERE id = 1`,
+		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.ActiveProfileID, string(sourcesJSON), st.SttBaseURL, st.WhisperModel, st.ActiveLLMConnectionID,
 	)
 	return err
 }
@@ -203,6 +278,136 @@ func (s *Store) SetAPIKey(key string) error {
 		return err
 	}
 	return keyring.Set(keyringService, keyringUser, key)
+}
+
+// GetConnectionAPIKey reads a connection's API key from the OS keychain.
+func (s *Store) GetConnectionAPIKey(id int64) (string, error) {
+	key, err := keyring.Get(keyringService, connKeyringUser(id))
+	if errors.Is(err, keyring.ErrNotFound) {
+		return "", nil
+	}
+	return key, err
+}
+
+// SetConnectionAPIKey stores (or, if empty, clears) a connection's API key.
+func (s *Store) SetConnectionAPIKey(id int64, key string) error {
+	if key == "" {
+		err := keyring.Delete(keyringService, connKeyringUser(id))
+		if errors.Is(err, keyring.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	return keyring.Set(keyringService, connKeyringUser(id), key)
+}
+
+// ListLLMConnections returns all saved LLM connections, newest-updated first,
+// each flagged with whether it has a stored API key.
+func (s *Store) ListLLMConnections() ([]LLMConnection, error) {
+	rows, err := s.db.Query(`SELECT id, name, base_url, model, updated_at FROM llm_connections ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	conns := []LLMConnection{}
+	for rows.Next() {
+		var c LLMConnection
+		if err := rows.Scan(&c.ID, &c.Name, &c.BaseURL, &c.Model, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if key, err := s.GetConnectionAPIKey(c.ID); err == nil && key != "" {
+			c.HasAPIKey = true
+		}
+		conns = append(conns, c)
+	}
+	return conns, rows.Err()
+}
+
+// GetLLMConnection returns a single connection by id.
+func (s *Store) GetLLMConnection(id int64) (LLMConnection, error) {
+	var c LLMConnection
+	row := s.db.QueryRow(`SELECT id, name, base_url, model, updated_at FROM llm_connections WHERE id = ?`, id)
+	if err := row.Scan(&c.ID, &c.Name, &c.BaseURL, &c.Model, &c.UpdatedAt); err != nil {
+		return LLMConnection{}, err
+	}
+	if key, err := s.GetConnectionAPIKey(c.ID); err == nil && key != "" {
+		c.HasAPIKey = true
+	}
+	return c, nil
+}
+
+// GetActiveLLMConnection returns the connection selected for analysis, falling
+// back to the most recently updated one if the active id is unset/stale.
+func (s *Store) GetActiveLLMConnection() (LLMConnection, error) {
+	var id int64
+	_ = s.db.QueryRow(`SELECT active_llm_connection_id FROM settings WHERE id = 1`).Scan(&id)
+	if id != 0 {
+		if c, err := s.GetLLMConnection(id); err == nil {
+			return c, nil
+		}
+	}
+	conns, err := s.ListLLMConnections()
+	if err != nil {
+		return LLMConnection{}, err
+	}
+	if len(conns) == 0 {
+		return LLMConnection{}, errors.New("no LLM connection configured")
+	}
+	return conns[0], nil
+}
+
+// SetActiveLLMConnection records which connection should drive analysis.
+func (s *Store) SetActiveLLMConnection(id int64) error {
+	_, err := s.db.Exec(`UPDATE settings SET active_llm_connection_id = ? WHERE id = 1`, id)
+	return err
+}
+
+// SaveLLMConnection inserts (ID == 0) or updates a connection, returning the
+// saved row. A newly inserted connection becomes active if none was set.
+func (s *Store) SaveLLMConnection(c LLMConnection) (LLMConnection, error) {
+	c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if c.ID == 0 {
+		res, err := s.db.Exec(
+			`INSERT INTO llm_connections (name, base_url, model, updated_at) VALUES (?, ?, ?, ?)`,
+			c.Name, c.BaseURL, c.Model, c.UpdatedAt,
+		)
+		if err != nil {
+			return LLMConnection{}, err
+		}
+		c.ID, _ = res.LastInsertId()
+		var active int64
+		_ = s.db.QueryRow(`SELECT active_llm_connection_id FROM settings WHERE id = 1`).Scan(&active)
+		if active == 0 {
+			_ = s.SetActiveLLMConnection(c.ID)
+		}
+		return c, nil
+	}
+	_, err := s.db.Exec(
+		`UPDATE llm_connections SET name = ?, base_url = ?, model = ?, updated_at = ? WHERE id = ?`,
+		c.Name, c.BaseURL, c.Model, c.UpdatedAt, c.ID,
+	)
+	return c, err
+}
+
+// DeleteLLMConnection removes a connection and its stored key. If it was the
+// active one, the most recently updated remaining connection becomes active.
+func (s *Store) DeleteLLMConnection(id int64) error {
+	if _, err := s.db.Exec(`DELETE FROM llm_connections WHERE id = ?`, id); err != nil {
+		return err
+	}
+	_ = s.SetConnectionAPIKey(id, "") // drop its key from the keychain
+
+	var active int64
+	_ = s.db.QueryRow(`SELECT active_llm_connection_id FROM settings WHERE id = 1`).Scan(&active)
+	if active == id {
+		next := int64(0)
+		if conns, err := s.ListLLMConnections(); err == nil && len(conns) > 0 {
+			next = conns[0].ID
+		}
+		return s.SetActiveLLMConnection(next)
+	}
+	return nil
 }
 
 // ListProfiles returns all saved profiles, most recently updated first.
