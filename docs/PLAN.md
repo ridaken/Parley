@@ -68,6 +68,28 @@ a meeting, and tame large pasted documents.
 - ✅ Idle setup strip uses a **complementary amber accent** so it stands out from the
   violet primary and neutral tiles.
 
+## Phase 2.10 — Analysis UX: action items, actionable suggestions, accumulating prompt ✅ *(new)*
+From a review of the LLM round-trip (payloads/prompt/presentation):
+- ✅ **Action-item tracking.** New `ActionItem{Text,Owner}` + `State.ActionItems`
+  (meeting-level — accumulates and survives topic changes, unlike topic assertions).
+  `mergeActionItemsLocked` folds each pass's items in, de-duped by normalized text, with
+  owner-backfill (first non-empty owner wins) and a `maxActionItems` cap. Surfaced in a new
+  **Action items** panel (owner chip / "Unassigned"). Persists via the existing opaque
+  `analysis_json` (no schema change).
+- ✅ **Accumulating prompt.** `buildUserPrompt` now feeds the model its prior
+  summary + assertions + tracked action items under **CURRENT UNDERSTANDING SO FAR**, and
+  `systemPrompt` tells it to update/merge rather than re-derive from the 60-line window
+  (less assertion "forgetting", less summary drift). Prior view snapshotted under lock via
+  `priorView` and threaded through `maybeAnalyze`→`analyze`→`buildUserPrompt`.
+- ✅ **Actionable suggestions.** Copy / pin / dismiss per suggestion; `mergeSuggestions`
+  (frontend, session-only, keyed by normalized text) keeps pinned ones from being wiped by
+  the next pass and hides dismissed ones. Action items get copy only.
+- ✅ **New-content highlighting.** `useNewKeys` briefly rings newly arrived assertions/
+  suggestions/action items; gated to live meetings (`highlight={running && !loaded}`) so a
+  resume/view doesn't strobe.
+- ✅ Analysis layout reflowed: Current topic is a full-width banner over a 2×2 of
+  Suggested questions / Action items / Assertions / Past topics.
+
 ## Test coverage
 Full suite passes with cgo enabled (`go test ./internal/... .`) and clean under `-race`:
 - `store`: settings, profile CRUD, **session save/load/delete round-trip**. Headless

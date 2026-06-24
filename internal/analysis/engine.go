@@ -27,6 +27,14 @@ type Suggestion struct {
 	Text string `json:"text"`
 }
 
+// ActionItem is a task/follow-up surfaced during the meeting, optionally owned by
+// someone. Unlike Assertion, action items are meeting-level: they accumulate for
+// the whole session and survive topic changes.
+type ActionItem struct {
+	Text  string `json:"text"`
+	Owner string `json:"owner"` // "" when no owner was stated
+}
+
 // Topic groups a title, a short summary, and the assertions made about it.
 type Topic struct {
 	Title      string      `json:"title"`
@@ -39,6 +47,9 @@ type State struct {
 	Current     Topic        `json:"current"`
 	Past        []Topic      `json:"past"`
 	Suggestions []Suggestion `json:"suggestions"`
+	// ActionItems are meeting-level: they accumulate across the whole session and
+	// are not tied to (or cleared with) the current topic.
+	ActionItems []ActionItem `json:"actionItems"`
 }
 
 // Context is the user-supplied background that grounds the analysis.
@@ -67,6 +78,7 @@ const (
 	maxTranscriptLines = 600
 	promptWindowLines  = 60
 	maxPastTopics      = 30
+	maxActionItems     = 100
 )
 
 type line struct {
@@ -192,7 +204,14 @@ func (e *Engine) maybeAnalyze(ctx context.Context) {
 		return // no new content
 	}
 	window := e.recentWindowLocked()
-	prevTitle := e.state.Current.Title
+	// Snapshot the prior analysis under the lock (copy the slices — the goroutine
+	// reads them after we unlock) so the model can refine rather than restart.
+	prior := priorView{
+		title:       e.state.Current.Title,
+		summary:     e.state.Current.Summary,
+		assertions:  append([]Assertion(nil), e.state.Current.Assertions...),
+		actionItems: append([]ActionItem(nil), e.state.ActionItems...),
+	}
 	notes := e.liveNotesForPromptLocked()
 	e.analyzedLen = len(e.transcript)
 	e.mu.Unlock()
@@ -200,7 +219,7 @@ func (e *Engine) maybeAnalyze(ctx context.Context) {
 	e.busy.Store(true)
 	go func() {
 		defer e.busy.Store(false)
-		e.analyze(ctx, window, prevTitle, notes)
+		e.analyze(ctx, window, prior, notes)
 	}()
 }
 
@@ -236,12 +255,22 @@ type llmResult struct {
 	TopicChanged        bool         `json:"topicChanged"`
 	Assertions          []Assertion  `json:"assertions"`
 	Suggestions         []Suggestion `json:"suggestions"`
+	ActionItems         []ActionItem `json:"actionItems"`
 }
 
-func (e *Engine) analyze(ctx context.Context, window, prevTitle string, notes []LiveNote) {
+// priorView is the engine's last analysis, fed back into the prompt so the model
+// refines and extends it instead of re-deriving everything from the recent window.
+type priorView struct {
+	title       string
+	summary     string
+	assertions  []Assertion
+	actionItems []ActionItem
+}
+
+func (e *Engine) analyze(ctx context.Context, window string, prior priorView, notes []LiveNote) {
 	messages := []llm.Message{
 		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: e.buildUserPrompt(window, prevTitle, notes)},
+		{Role: "user", Content: e.buildUserPrompt(window, prior, notes)},
 	}
 	reply, err := e.client.Complete(ctx, messages)
 	if err != nil {
@@ -277,6 +306,9 @@ func (e *Engine) analyze(ctx context.Context, window, prevTitle string, notes []
 		Assertions: res.Assertions,
 	}
 	e.state.Suggestions = res.Suggestions
+	// Action items are meeting-level: merge regardless of topicChanged so they
+	// accumulate across the whole session and never drop on a topic rollover.
+	e.mergeActionItemsLocked(res.ActionItems)
 	snapshot := e.cloneStateLocked()
 	e.mu.Unlock()
 
@@ -298,13 +330,57 @@ func (e *Engine) dropTopicNotesLocked() {
 	e.liveNotes = kept
 }
 
+// mergeActionItemsLocked folds the model's per-pass action items into the
+// meeting-level accumulating list. Items are keyed by normalized text so the same
+// item re-emitted across passes isn't duplicated; an owner is backfilled when one
+// is stated later, but an existing non-empty owner is never overwritten (avoids
+// churn from model noise). The list is capped at maxActionItems (oldest dropped).
+func (e *Engine) mergeActionItemsLocked(incoming []ActionItem) {
+	if len(incoming) == 0 {
+		return
+	}
+	index := make(map[string]int, len(e.state.ActionItems))
+	for i, a := range e.state.ActionItems {
+		index[normalizeActionItem(a.Text)] = i
+	}
+	for _, in := range incoming {
+		text := strings.TrimSpace(in.Text)
+		if text == "" {
+			continue
+		}
+		owner := strings.TrimSpace(in.Owner)
+		key := normalizeActionItem(text)
+		if i, ok := index[key]; ok {
+			if e.state.ActionItems[i].Owner == "" && owner != "" {
+				e.state.ActionItems[i].Owner = owner
+			}
+			continue
+		}
+		index[key] = len(e.state.ActionItems)
+		e.state.ActionItems = append(e.state.ActionItems, ActionItem{Text: text, Owner: owner})
+	}
+	if len(e.state.ActionItems) > maxActionItems {
+		e.state.ActionItems = e.state.ActionItems[len(e.state.ActionItems)-maxActionItems:]
+	}
+}
+
+// normalizeActionItem produces the identity key for de-duplicating action items:
+// lowercased, whitespace-collapsed, and stripped of trailing sentence punctuation.
+func normalizeActionItem(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.TrimRight(s, ".!?")
+}
+
 func (e *Engine) cloneStateLocked() State {
 	past := make([]Topic, len(e.state.Past))
 	copy(past, e.state.Past)
-	return State{Current: e.state.Current, Past: past, Suggestions: e.state.Suggestions}
+	ai := make([]ActionItem, len(e.state.ActionItems))
+	copy(ai, e.state.ActionItems)
+	return State{Current: e.state.Current, Past: past, Suggestions: e.state.Suggestions, ActionItems: ai}
 }
 
-func (e *Engine) buildUserPrompt(window, prevTitle string, notes []LiveNote) string {
+func (e *Engine) buildUserPrompt(window string, prior priorView, notes []LiveNote) string {
 	var b strings.Builder
 	b.WriteString("MEETING CONTEXT\n")
 	if e.bg.Summary != "" {
@@ -341,7 +417,31 @@ func (e *Engine) buildUserPrompt(window, prevTitle string, notes []LiveNote) str
 		}
 	}
 
-	fmt.Fprintf(&b, "\nPREVIOUS TOPIC TITLE: %s\n", orNone(prevTitle))
+	fmt.Fprintf(&b, "\nPREVIOUS TOPIC TITLE: %s\n", orNone(prior.title))
+
+	if prior.summary != "" || len(prior.assertions) > 0 || len(prior.actionItems) > 0 {
+		b.WriteString("\nCURRENT UNDERSTANDING SO FAR (your prior analysis — refine and extend it, don't restart):\n")
+		if prior.summary != "" {
+			fmt.Fprintf(&b, "Summary: %s\n", prior.summary)
+		}
+		if len(prior.assertions) > 0 {
+			b.WriteString("Assertions:\n")
+			for _, a := range prior.assertions {
+				fmt.Fprintf(&b, "- %s: %s\n", a.Speaker, a.Text)
+			}
+		}
+		if len(prior.actionItems) > 0 {
+			b.WriteString("Action items tracked so far (meeting-wide; do NOT re-list these unless adding an owner):\n")
+			for _, a := range prior.actionItems {
+				owner := a.Owner
+				if owner == "" {
+					owner = "unassigned"
+				}
+				fmt.Fprintf(&b, "- %s [owner: %s]\n", a.Text, owner)
+			}
+		}
+	}
+
 	b.WriteString("\nRECENT TRANSCRIPT. Speaker labels: \"You\" = the listener; \"Others\" = remote/other participants; \"Room\" = an in-person/mixed capture where individuals (possibly including the listener) are not separable:\n")
 	b.WriteString(window)
 	b.WriteString("\nReturn the JSON object now.")
@@ -357,12 +457,14 @@ func orNone(s string) string {
 
 const systemPrompt = `You monitor a live meeting transcript and maintain structured notes for the listener.
 Respond with ONLY a single minified JSON object (no markdown, no prose) of this shape:
-{"currentTopicTitle": string, "currentTopicSummary": string (1-2 sentences), "topicChanged": boolean, "assertions": [{"speaker": string (use the speaker label exactly as it appears in the transcript), "text": string}], "suggestions": [{"kind": "question"|"clarification", "text": string}]}.
+{"currentTopicTitle": string, "currentTopicSummary": string (1-2 sentences), "topicChanged": boolean, "assertions": [{"speaker": string (use the speaker label exactly as it appears in the transcript), "text": string}], "suggestions": [{"kind": "question"|"clarification", "text": string}], "actionItems": [{"text": string, "owner": string}]}.
+You are given your CURRENT UNDERSTANDING SO FAR (your prior analysis). Update and merge it rather than starting over: refine the summary, keep still-valid assertions, add new ones from the recent transcript, and do not drop a still-valid assertion just because it isn't repeated in the recent window. Avoid restating duplicates.
 - topicChanged: set true ONLY when the discussion has genuinely moved to a different subject than the PREVIOUS TOPIC TITLE. While the conversation is still about that subject — even as new points, details, or sub-points come up — set it false. A topic spans the whole discussion of a subject, not each individual statement; do not split a continuing discussion into many topics.
 - currentTopicTitle: when topicChanged is false, reuse the PREVIOUS TOPIC TITLE EXACTLY as given — do not reword, rephrase, shorten, or "improve" it. Only write a new title when topicChanged is true.
 - assertions: the key claims/points/decisions stated about the current topic (max 6, most recent/important first).
 - suggestions: sharp questions the listener could ask right now, or things that need clarification (max 4).
-Be concise and specific. If the transcript is too sparse to tell, use an empty array and a best-effort title.`
+- actionItems: tasks, follow-ups, or commitments stated in the RECENT TRANSCRIPT, with owner set to the responsible person's name/label if stated (else ""). List only items visible in this window — earlier ones are already tracked for you under CURRENT UNDERSTANDING SO FAR; re-list a tracked item only to add an owner that was just stated.
+Be concise and specific. If the transcript is too sparse to tell, use empty arrays and a best-effort title.`
 
 // parseResult extracts the first JSON object from an LLM reply and unmarshals it.
 func parseResult(reply string) (llmResult, error) {
