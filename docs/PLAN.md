@@ -70,14 +70,24 @@ a meeting, and tame large pasted documents.
 
 ## Test coverage
 Full suite passes with cgo enabled (`go test ./internal/... .`) and clean under `-race`:
-- `store`: settings, profile CRUD, **session save/load/delete round-trip**.
-- `analysis`: JSON parse, emit, **topic-diff archiving**, **live-note scoping/expiry**,
+- `store`: settings, profile CRUD, **session save/load/delete round-trip**. Headless
+  runs set `PARLEY_KEYRING_MOCK=1` (TestMain swaps in go-keyring's in-memory provider,
+  since CI has no OS keychain); locally the var is unset and the real keychain is used.
+- `analysis`: JSON parse (incl. **malformed-reply rejection**), emit, **topic-diff
+  archiving**, **stable-title-on-unchanged-topic**, **live-note scoping/expiry**,
   **resume/Restore seeding**.
+- `condense`: **meeting-notes condense** — empty-input/empty-reply guards, system-prompt
+  wiring, trimming, and error propagation (via a stub completer; 100% statements).
 - `stt`: **chunker windowing + timeline + silence-skip**, peak amplitude, server headless.
 - `llm`: completion success, HTTP/API error surfacing, base-URL normalisation.
 - `audio`: device listing, **WAV encode + incremental writer header patching**.
 Verified end-to-end: `go build`/`go vet` clean, `wails3 generate bindings` clean, frontend
 `tsc` + production `vite build` clean.
+
+**CI** (`.github/workflows/ci.yml`): on every PR, runs gofmt/vet/test (`-cover`) over the
+pure-Go packages (`store`, `analysis`, `llm`, `condense`) and a frontend `npm run build`
+(tsc + vite). The cgo packages (`audio`, `stt`) and the root package need a C compiler +
+Wails toolchain, so they stay covered by the maintainer's local `wails3 build` rather than CI.
 
 ## Phase 3 — Polish ⏳
 - ⏳ Session history **full-text search**; export (Markdown minutes / action items).
