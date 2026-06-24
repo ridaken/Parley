@@ -48,7 +48,8 @@ type Settings struct {
 	// server (e.g. http://host:8765) instead of launching the bundled engine.
 	SttBaseURL string `json:"sttBaseURL"`
 	// WhisperModel is the model filename under resources/whisper/models used by the
-	// bundled engine. A small model (e.g. ggml-base.en.bin) keeps CPU use light.
+	// bundled engine. Defaults to ggml-small.en-q5_1.bin (quantized; accurate but
+	// light on CPU).
 	WhisperModel string `json:"whisperModel"`
 	// ActiveLLMConnectionID selects which saved LLM connection drives analysis.
 	ActiveLLMConnectionID int64 `json:"activeLLMConnectionID"`
@@ -166,7 +167,7 @@ CREATE TABLE IF NOT EXISTS llm_connections (
 	if err := s.addColumn("settings", "stt_base_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := s.addColumn("settings", "whisper_model", "TEXT NOT NULL DEFAULT 'ggml-base.en.bin'"); err != nil {
+	if err := s.addColumn("settings", "whisper_model", "TEXT NOT NULL DEFAULT 'ggml-small.en-q5_1.bin'"); err != nil {
 		return err
 	}
 	if err := s.addColumn("settings", "active_llm_connection_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -230,7 +231,7 @@ func (s *Store) GetSettings() (Settings, error) {
 		return Settings{}, err
 	}
 	if st.WhisperModel == "" {
-		st.WhisperModel = "ggml-base.en.bin"
+		st.WhisperModel = "ggml-small.en-q5_1.bin"
 	}
 	st.CaptureSources = []CaptureSource{}
 	if sourcesJSON != "" {

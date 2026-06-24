@@ -27,6 +27,20 @@ export interface CaptureSource {
 }
 
 /**
+ * LLMConnection is a saved, named LLM endpoint the user can switch between
+ * (e.g. a local llama-server, a cloud provider). The API key is kept in the OS
+ * keychain, never in this struct or the database.
+ */
+export interface LLMConnection {
+    "id": number;
+    "name": string;
+    "baseURL": string;
+    "model": string;
+    "hasAPIKey": boolean;
+    "updatedAt": string;
+}
+
+/**
  * LiveNote is a piece of context the user injects mid-meeting. A "meeting"-scoped
  * note applies for the whole session (names, themes); a "topic"-scoped note only
  * applies while its topic is current and expires when the topic rolls over.
@@ -45,19 +59,6 @@ export interface LiveNote {
     "topicTitle": string;
     "text": string;
     "createdAt": string;
-}
-
-/**
- * LLMConnection is a saved, named LLM endpoint the user can switch between.
- * The API key is kept in the OS keychain, never in this struct.
- */
-export interface LLMConnection {
-    "id": number;
-    "name": string;
-    "baseURL": string;
-    "model": string;
-    "hasAPIKey": boolean;
-    "updatedAt": string;
 }
 
 /**

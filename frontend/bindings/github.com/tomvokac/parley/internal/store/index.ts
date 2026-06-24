@@ -3,6 +3,7 @@
 
 export type {
     CaptureSource,
+    LLMConnection,
     LiveNote,
     Profile,
     Session,
