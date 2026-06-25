@@ -15,7 +15,7 @@ import {
 import { MeetingService, LibraryService } from "../bindings/github.com/tomvokac/parley";
 import type { StatusEvent } from "../bindings/github.com/tomvokac/parley";
 import type { Segment } from "../bindings/github.com/tomvokac/parley/internal/stt/models";
-import type { State as AnalysisState } from "../bindings/github.com/tomvokac/parley/internal/analysis/models";
+import type { State as AnalysisState, Suggestion } from "../bindings/github.com/tomvokac/parley/internal/analysis/models";
 import type { LiveNote, LLMConnection } from "../bindings/github.com/tomvokac/parley/internal/store/models";
 import type { LoadedSession } from "../bindings/github.com/tomvokac/parley/models";
 
@@ -39,6 +39,7 @@ import { AudioSourceButton } from "@/components/AudioSourceButton";
 import { SessionsDialog } from "@/components/SessionsDialog";
 import { LiveContextBar, type NoteScope } from "@/components/LiveContextBar";
 import { speakerVariant } from "@/lib/speaker";
+import { normKey } from "@/lib/normalize";
 
 function fmtTime(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -57,7 +58,34 @@ const EMPTY_ANALYSIS: AnalysisState = {
   current: { title: "", summary: "", assertions: [] },
   past: [],
   suggestions: [],
+  actionItems: [],
 };
+
+// mergeSuggestions reconciles a fresh analysis pass with the user's pins/dismissals.
+// The model replaces the whole suggestions array each pass, so without this a pinned
+// suggestion would vanish and a dismissed one would reappear. Pinned items lead (in
+// pin order), dismissed items are dropped, then the model's fresh items follow —
+// de-duplicated by normalized text so a re-emitted pin isn't shown twice.
+function mergeSuggestions(
+  incoming: Suggestion[],
+  pinned: Map<string, Suggestion>,
+  dismissed: Set<string>
+): Suggestion[] {
+  const seen = new Set<string>();
+  const out: Suggestion[] = [];
+  for (const [key, s] of pinned) {
+    if (dismissed.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  for (const s of incoming) {
+    const key = normKey(s.text);
+    if (dismissed.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
 
 function StatusPill({ status }: { status: StatusEvent }) {
   const live = status.state === "listening";
@@ -106,7 +134,22 @@ function App() {
   const [conns, setConns] = useState<LLMConnection[]>([]);
   const [activeConnId, setActiveConnId] = useState<number>(0);
   const [activeContext, setActiveContext] = useState<string | null>(null);
+  // Session-scoped suggestion pins/dismissals, keyed by normalized text. The
+  // `analysis` listener is registered once, so it reads these via refs to avoid a
+  // stale closure.
+  const [pinned, setPinned] = useState<Map<string, Suggestion>>(new Map());
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const pinnedRef = useRef(pinned);
+  const dismissedRef = useRef(dismissed);
+  pinnedRef.current = pinned;
+  dismissedRef.current = dismissed;
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // Forget pins/dismissals at meeting boundaries (new / cleared / loaded session).
+  const resetSuggestionState = () => {
+    setPinned(new Map());
+    setDismissed(new Set());
+  };
 
   // Name of the context profile that will ground the next meeting (null = none
   // selected), so the idle setup strip can show whether the LLM has background.
@@ -178,10 +221,19 @@ function App() {
       setSegments((prev) => [...prev, e.data].sort((a, b) => a.startMs - b.startMs));
     });
     const offAnalysis = Events.On("analysis", (e: { data: AnalysisState }) => {
-      const next = e.data ?? EMPTY_ANALYSIS;
+      const raw = e.data ?? EMPTY_ANALYSIS;
+      const next: AnalysisState = {
+        ...raw,
+        suggestions: mergeSuggestions(
+          raw.suggestions ?? [],
+          pinnedRef.current,
+          dismissedRef.current
+        ),
+        actionItems: raw.actionItems ?? [],
+      };
       setAnalysis(next);
       // Mirror the backend: topic-scoped notes expire when the topic changes.
-      const title = next.current?.title ?? "";
+      const title = raw.current?.title ?? "";
       setNotes((prev) =>
         prev.filter((n) => n.scope === "meeting" || n.topicTitle === title)
       );
@@ -211,6 +263,7 @@ function App() {
         setSegments([]);
         setAnalysis(EMPTY_ANALYSIS);
         setNotes([]);
+        resetSuggestionState();
         await MeetingService.Start();
       }
     } catch (err) {
@@ -228,10 +281,40 @@ function App() {
     }
   };
 
+  // Toggle a suggestion's pin and re-merge the visible list now (don't wait for the
+  // next analysis pass) using the just-computed pin map.
+  const pinSuggestion = (s: Suggestion) => {
+    const key = normKey(s.text);
+    const nextPinned = new Map(pinned);
+    if (nextPinned.has(key)) nextPinned.delete(key);
+    else nextPinned.set(key, s);
+    setPinned(nextPinned);
+    setAnalysis((a) => ({
+      ...a,
+      suggestions: mergeSuggestions(a.suggestions ?? [], nextPinned, dismissedRef.current),
+    }));
+  };
+
+  // Dismiss a suggestion for the rest of the session (dismiss also clears any pin).
+  const dismissSuggestion = (s: Suggestion) => {
+    const key = normKey(s.text);
+    setDismissed((d) => new Set(d).add(key));
+    if (pinned.has(key)) {
+      const nextPinned = new Map(pinned);
+      nextPinned.delete(key);
+      setPinned(nextPinned);
+    }
+    setAnalysis((a) => ({
+      ...a,
+      suggestions: (a.suggestions ?? []).filter((x) => normKey(x.text) !== key),
+    }));
+  };
+
   const viewSession = (s: LoadedSession) => {
     setSegments([...(s.segments ?? [])].sort((a, b) => a.startMs - b.startMs));
     setAnalysis(s.analysis ?? EMPTY_ANALYSIS);
     setNotes(s.liveNotes ?? []);
+    resetSuggestionState();
     setLoaded({ id: s.session.id, title: s.session.title });
   };
 
@@ -252,6 +335,7 @@ function App() {
     setSegments([]);
     setAnalysis(EMPTY_ANALYSIS);
     setNotes([]);
+    resetSuggestionState();
   };
 
   const startLabel = loaded ? "Resume meeting" : "Start listening";
@@ -467,7 +551,14 @@ function App() {
           <LiveContextBar disabled={!running} onSend={sendNote} />
         </Card>
 
-        <AnalysisPanels state={analysis} active={running} />
+        <AnalysisPanels
+          state={analysis}
+          active={running}
+          highlight={running && !loaded}
+          pinnedKeys={new Set(pinned.keys())}
+          onPin={pinSuggestion}
+          onDismiss={dismissSuggestion}
+        />
       </main>
 
       <AudioDialog open={audioOpen} onOpenChange={setAudioOpen} />

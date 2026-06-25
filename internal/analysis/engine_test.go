@@ -3,6 +3,7 @@ package analysis
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,7 +16,8 @@ func TestParseResult(t *testing.T) {
 	// Model wraps JSON in prose/markdown — parser must still extract it.
 	reply := "Sure!\n```json\n{\"currentTopicTitle\":\"Budget\",\"topicChanged\":true," +
 		"\"assertions\":[{\"speaker\":\"Others\",\"text\":\"Q3 is over budget\"}]," +
-		"\"suggestions\":[{\"kind\":\"question\",\"text\":\"By how much?\"}]}\n```"
+		"\"suggestions\":[{\"kind\":\"question\",\"text\":\"By how much?\"}]," +
+		"\"actionItems\":[{\"text\":\"Cut costs\",\"owner\":\"Sam\"}]}\n```"
 	res, err := parseResult(reply)
 	if err != nil {
 		t.Fatalf("parseResult: %v", err)
@@ -28,6 +30,9 @@ func TestParseResult(t *testing.T) {
 	}
 	if len(res.Suggestions) != 1 || res.Suggestions[0].Kind != "question" {
 		t.Fatalf("suggestions wrong: %+v", res.Suggestions)
+	}
+	if len(res.ActionItems) != 1 || res.ActionItems[0].Text != "Cut costs" || res.ActionItems[0].Owner != "Sam" {
+		t.Fatalf("action items wrong: %+v", res.ActionItems)
 	}
 }
 
@@ -69,7 +74,7 @@ func TestEngineEmitsAnalysis(t *testing.T) {
 		}
 	})
 
-	eng.analyze(context.Background(), "Others: I think we slip to May.\n", "", nil)
+	eng.analyze(context.Background(), "Others: I think we slip to May.\n", priorView{}, nil)
 
 	select {
 	case s := <-got:
@@ -95,7 +100,7 @@ func TestLiveNoteScoping(t *testing.T) {
 	eng.AddLiveNote(ScopeTopic, "Topic is margins, not revenue")
 
 	// Both notes apply while "Pricing" is current.
-	prompt := eng.buildUserPrompt("You: hi\n", "", eng.snapshotNotes())
+	prompt := eng.buildUserPrompt("You: hi\n", priorView{}, eng.snapshotNotes())
 	if !contains(prompt, "Acme") || !contains(prompt, "margins") {
 		t.Fatalf("expected both notes in prompt:\n%s", prompt)
 	}
@@ -106,7 +111,7 @@ func TestLiveNoteScoping(t *testing.T) {
 	eng.state.Current = Topic{Title: "Timeline"}
 	eng.mu.Unlock()
 
-	prompt = eng.buildUserPrompt("You: hi\n", "Pricing", eng.snapshotNotes())
+	prompt = eng.buildUserPrompt("You: hi\n", priorView{title: "Pricing"}, eng.snapshotNotes())
 	if !contains(prompt, "Acme") {
 		t.Fatalf("meeting note should persist:\n%s", prompt)
 	}
@@ -157,7 +162,7 @@ func TestRestoreSeedsStateWithoutReanalyzing(t *testing.T) {
 		t.Fatalf("analyzedLen=%d transcript=%d, want %d", eng.analyzedLen, len(eng.transcript), len(history))
 	}
 	// Both notes are in effect while "Budget" is current.
-	prompt := eng.buildUserPrompt("You: hi\n", "", eng.snapshotNotes())
+	prompt := eng.buildUserPrompt("You: hi\n", priorView{}, eng.snapshotNotes())
 	if !contains(prompt, "Acme") || !contains(prompt, "opex") {
 		t.Fatalf("restored notes missing from prompt:\n%s", prompt)
 	}
@@ -183,10 +188,10 @@ func TestEngineKeepsStableTitleWhenTopicUnchanged(t *testing.T) {
 	done := make(chan State, 2)
 	eng := NewEngine(llm.NewClient(srv.URL, "", "m"), 3*time.Second, Context{}, func(s State) { done <- s })
 
-	eng.analyze(context.Background(), "Others: line one\n", "", nil)
+	eng.analyze(context.Background(), "Others: line one\n", priorView{}, nil)
 	<-done // establishes "Budget planning"
 
-	eng.analyze(context.Background(), "Others: line two\n", "Budget planning", nil)
+	eng.analyze(context.Background(), "Others: line two\n", priorView{title: "Budget planning"}, nil)
 	s := <-done
 	if s.Current.Title != "Budget planning" {
 		t.Fatalf("title churned to %q, want stable %q", s.Current.Title, "Budget planning")
@@ -266,6 +271,113 @@ func TestRecentWindowCapsAtPromptWindow(t *testing.T) {
 	}
 }
 
+func TestMergeActionItemsAccumulatesDedupsAndBackfillsOwner(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+
+	eng.mergeActionItemsLocked([]ActionItem{{Text: "Send the budget deck"}})
+	eng.mergeActionItemsLocked([]ActionItem{
+		{Text: "send the budget deck.", Owner: "Sam"}, // same item (normalized) + owner
+		{Text: "Book the room"},                       // genuinely new
+		{Text: "   "},                                 // blank, ignored
+	})
+
+	if len(eng.state.ActionItems) != 2 {
+		t.Fatalf("want 2 items after dedup, got %d: %+v", len(eng.state.ActionItems), eng.state.ActionItems)
+	}
+	if eng.state.ActionItems[0].Owner != "Sam" {
+		t.Fatalf("owner not backfilled: %+v", eng.state.ActionItems[0])
+	}
+
+	// A later, differing owner must not overwrite an owner already set.
+	eng.mergeActionItemsLocked([]ActionItem{{Text: "Send the budget deck", Owner: "Alex"}})
+	if eng.state.ActionItems[0].Owner != "Sam" {
+		t.Fatalf("non-empty owner was overwritten: %+v", eng.state.ActionItems[0])
+	}
+}
+
+func TestActionItemsCapAtMax(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	for i := 0; i < maxActionItems+10; i++ {
+		eng.mergeActionItemsLocked([]ActionItem{{Text: fmt.Sprintf("task %d", i)}})
+	}
+	if len(eng.state.ActionItems) != maxActionItems {
+		t.Fatalf("want cap %d, got %d", maxActionItems, len(eng.state.ActionItems))
+	}
+	last := eng.state.ActionItems[len(eng.state.ActionItems)-1]
+	if last.Text != fmt.Sprintf("task %d", maxActionItems+9) {
+		t.Fatalf("newest item should be retained, got %q", last.Text)
+	}
+	if eng.state.ActionItems[0].Text == "task 0" {
+		t.Fatalf("oldest item should have been dropped")
+	}
+}
+
+func TestActionItemsSurviveTopicChange(t *testing.T) {
+	replies := []string{
+		`{"currentTopicTitle":"Topic A","topicChanged":false,"assertions":[],"suggestions":[],"actionItems":[{"text":"Email the vendor","owner":"Dana"}]}`,
+		`{"currentTopicTitle":"Topic B","topicChanged":true,"assertions":[{"speaker":"You","text":"new point"}],"suggestions":[],"actionItems":[]}`,
+	}
+	var idx int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": replies[idx%len(replies)]}}},
+		})
+		idx++
+	}))
+	defer srv.Close()
+
+	done := make(chan State, 2)
+	eng := NewEngine(llm.NewClient(srv.URL, "", "m"), 3*time.Second, Context{}, func(s State) { done <- s })
+
+	eng.analyze(context.Background(), "Others: a\n", priorView{}, nil)
+	<-done
+	eng.analyze(context.Background(), "Others: b\n", priorView{title: "Topic A"}, nil)
+	s := <-done
+
+	if s.Current.Title != "Topic B" || len(s.Past) != 1 {
+		t.Fatalf("topic change should archive Topic A: cur=%q past=%+v", s.Current.Title, s.Past)
+	}
+	if len(s.ActionItems) != 1 || s.ActionItems[0].Text != "Email the vendor" || s.ActionItems[0].Owner != "Dana" {
+		t.Fatalf("action item must survive topic change: %+v", s.ActionItems)
+	}
+}
+
+func TestBuildUserPromptIncludesUnderstanding(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	prior := priorView{
+		title:      "Budget",
+		summary:    "Discussing Q3 spend.",
+		assertions: []Assertion{{Speaker: "Others", Text: "we are over budget"}},
+		actionItems: []ActionItem{
+			{Text: "Send deck"},
+			{Text: "Approve PO", Owner: "Lee"},
+		},
+	}
+	prompt := eng.buildUserPrompt("You: hi\n", prior, nil)
+	for _, want := range []string{
+		"CURRENT UNDERSTANDING SO FAR",
+		"Discussing Q3 spend.",
+		"- Others: we are over budget",
+		"Send deck [owner: unassigned]",
+		"Approve PO [owner: Lee]",
+	} {
+		if !contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestRestoreRehydratesActionItems(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	eng.Restore(State{
+		Current:     Topic{Title: "Budget"},
+		ActionItems: []ActionItem{{Text: "Send deck", Owner: "Sam"}},
+	}, nil, nil)
+	if len(eng.state.ActionItems) != 1 || eng.state.ActionItems[0].Owner != "Sam" {
+		t.Fatalf("action items not rehydrated: %+v", eng.state.ActionItems)
+	}
+}
+
 func TestStartStopIsClean(t *testing.T) {
 	// Unreachable endpoint is fine: with no transcript fed, the loop never calls
 	// the LLM. This exercises Start/loop/Stop teardown without deadlocking.
@@ -293,10 +405,10 @@ func TestEngineArchivesPastTopic(t *testing.T) {
 	done := make(chan State, 2)
 	eng := NewEngine(client, 3*time.Second, Context{}, func(s State) { done <- s })
 
-	eng.analyze(context.Background(), "Others: line one\n", "", nil)
+	eng.analyze(context.Background(), "Others: line one\n", priorView{}, nil)
 	<-done // Topic A
 
-	eng.analyze(context.Background(), "Others: line two\n", "Topic A", nil)
+	eng.analyze(context.Background(), "Others: line two\n", priorView{title: "Topic A"}, nil)
 	s := <-done // Topic B, A archived
 
 	if s.Current.Title != "Topic B" {
