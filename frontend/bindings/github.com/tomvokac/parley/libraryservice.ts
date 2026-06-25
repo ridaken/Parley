@@ -18,7 +18,8 @@ import * as store$0 from "./internal/store/models.js";
  * CondenseContext uses the active LLM connection to compress user-supplied
  * meeting context (typically the free-form notes, where pasted documents land)
  * into a denser form that preserves the concrete facts. It returns the condensed
- * text for the UI to preview; it never mutates a saved profile itself.
+ * text for the UI to preview; it never mutates a saved profile itself. The
+ * prompt/validation logic lives in internal/condense so it stays unit-testable.
  */
 export function CondenseContext(text: string): $CancellablePromise<string> {
     return $Call.ByID(3402042464, text);
