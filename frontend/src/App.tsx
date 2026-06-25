@@ -8,6 +8,7 @@ import {
   Loader2,
   MessageSquareText,
   NotebookPen,
+  Plus,
   Settings as SettingsIcon,
   Square,
   X,
@@ -52,6 +53,7 @@ const STATE_LABEL: Record<string, string> = {
   idle: "Idle",
   starting: "Starting…",
   listening: "Listening",
+  finalizing: "Finalizing…",
   error: "Error",
 };
 
@@ -220,6 +222,23 @@ function App() {
   }, [audioOpen]);
 
   useEffect(() => {
+    const logFrontendError = (message: string, source: string, stack = "") => {
+      LibraryService.LogFrontendError(message, source, stack).catch(() => {});
+    };
+    const onError = (e: ErrorEvent) => {
+      logFrontendError(e.message || "Frontend error", e.filename || "window.onerror", e.error?.stack ?? "");
+    };
+    const onRejection = (e: PromiseRejectionEvent) => {
+      const reason = e.reason;
+      logFrontendError(
+        reason?.message ? String(reason.message) : String(reason ?? "Unhandled promise rejection"),
+        "unhandledrejection",
+        reason?.stack ? String(reason.stack) : ""
+      );
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+
     MeetingService.IsRunning()
       .then((r) => {
         if (r) {
@@ -281,6 +300,8 @@ function App() {
       );
     });
     return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
       offStatus();
       offTranscript();
       offAnalysisStatus();
@@ -293,6 +314,8 @@ function App() {
   }, [segments]);
 
   const running = status.state === "listening" || status.state === "starting";
+  const finalizing = status.state === "finalizing";
+  const active = running || finalizing;
   const bannerError = status.state === "error" ? status.message : uiError;
 
   const toggle = async () => {
@@ -407,6 +430,11 @@ function App() {
     resetSuggestionState();
   };
 
+  const newMeeting = () => {
+    if (active || busy) return;
+    clearLoaded();
+  };
+
   const startLabel = loaded ? "Resume meeting" : "Start listening";
   const canExport = running || loaded != null || hasRecentSession;
   const exportDisabled = exportBusy || !canExport;
@@ -432,10 +460,20 @@ function App() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            title={active ? "Wait for the current meeting to finish" : "Start a fresh meeting"}
+            disabled={active || busy}
+            onClick={newMeeting}
+          >
+            <Plus className="h-4 w-4" /> New meeting
+          </Button>
+
           <AudioSourceButton
             status={status}
             micConfigured={micConfigured}
-            running={running}
+            running={active}
             onOpen={() => setAudioOpen(true)}
           />
 
@@ -459,12 +497,12 @@ function App() {
             <Select
               value={activeConnId ? String(activeConnId) : undefined}
               onValueChange={(v) => pickConnection(Number(v))}
-              disabled={running}
+              disabled={active}
             >
               <SelectTrigger
                 className="h-8 w-[150px] text-xs"
                 title={
-                  running
+                  active
                     ? "Stop the meeting to switch LLM connection"
                     : "LLM connection used for analysis"
                 }
@@ -509,12 +547,15 @@ function App() {
 
           <Button
             onClick={toggle}
-            disabled={busy}
+            disabled={busy || finalizing}
             variant={running ? "destructive" : "default"}
             className="min-w-28"
           >
-            {busy ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+            {busy || finalizing ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {finalizing ? "Finalizing" : ""}
+              </>
             ) : running ? (
               <>
                 <Square className="h-4 w-4" /> Stop
@@ -544,7 +585,16 @@ function App() {
         </div>
       )}
 
-      {loaded && !running && (
+      {finalizing && (
+        <div className="flex items-center gap-2 border-b border-primary/30 bg-primary/10 px-5 py-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 shrink-0 animate-spin text-primary" />
+          <span className="min-w-0 truncate">
+            Finalizing meeting transcript and notes. Keep Parley open while the remaining audio and analysis finish.
+          </span>
+        </div>
+      )}
+
+      {loaded && !active && (
         <div className="flex items-center gap-2 border-b bg-accent/30 px-5 py-2 text-sm">
           <History className="h-4 w-4 text-muted-foreground" />
           <span className="min-w-0 truncate">
@@ -563,7 +613,7 @@ function App() {
         </div>
       )}
 
-      {!running && !loaded && (
+      {!active && !loaded && (
         <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-sm">
           <NotebookPen className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
           {activeContext ? (
@@ -646,7 +696,7 @@ function App() {
 
         <AnalysisPanels
           state={analysis}
-          active={running}
+          active={active}
           highlight={running && !loaded}
           pinnedKeys={new Set(pinned.keys())}
           onPin={pinSuggestion}
@@ -662,7 +712,8 @@ function App() {
         onOpenChange={setSessionsOpen}
         onView={viewSession}
         onResume={resumeSession}
-        disabled={running}
+        disabled={active}
+        onExport={(id) => MeetingService.ExportMarkdown(id)}
       />
     </div>
   );

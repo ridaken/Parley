@@ -233,30 +233,53 @@ export function AnalysisPanels({
 
   return (
     <div className="flex min-h-0 flex-col gap-4">
-      {/* Current topic — full-width banner, sized to its content. */}
-      <Panel
-        title="Current topic"
-        icon={<MessageSquareText className="h-4 w-4 text-primary" />}
-        scroll={false}
-        className="shrink-0"
-      >
-        {hasTopic ? (
-          <div className="flex flex-col gap-2 py-1">
-            <div className="text-base font-semibold leading-snug">
-              {current.title}
+      <div className="grid h-36 shrink-0 grid-cols-2 gap-4">
+        <Panel
+          title="Current topic"
+          icon={<MessageSquareText className="h-4 w-4 text-primary" />}
+          scroll={false}
+        >
+          {hasTopic ? (
+            <div className="flex flex-col gap-2 py-1">
+              <div className="text-base font-semibold leading-snug">
+                {current.title}
+              </div>
+              {current.summary && (
+                <p className="text-sm text-muted-foreground leading-relaxed">
+                  {current.summary}
+                </p>
+              )}
             </div>
-            {current.summary && (
-              <p className="text-sm text-muted-foreground leading-relaxed">
-                {current.summary}
-              </p>
-            )}
-          </div>
-        ) : (
-          <div className="py-6 text-center text-xs text-muted-foreground/50">
-            {idleHint}
-          </div>
-        )}
-      </Panel>
+          ) : (
+            <div className="py-6 text-center text-xs text-muted-foreground/50">
+              {idleHint}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Past topics" icon={<History className="h-4 w-4" />}>
+          {past.length ? (
+            <ul className="flex flex-col gap-2 py-1">
+              {[...past].reverse().map((t, i) => (
+                <li key={i} className="rounded-md border border-border/60 p-2">
+                  <div className="text-sm font-medium">{t.title}</div>
+                  {t.summary && (
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      {t.summary}
+                    </div>
+                  )}
+                  <div className="mt-1 text-[10px] text-muted-foreground/60">
+                    {t.assertions?.length ?? 0} assertion
+                    {(t.assertions?.length ?? 0) === 1 ? "" : "s"}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <Empty>Earlier topics will be archived here.</Empty>
+          )}
+        </Panel>
+      </div>
 
       <Panel
         title="Live summary"
@@ -266,11 +289,11 @@ export function AnalysisPanels({
         <SummaryContent summary={summary} />
       </Panel>
 
-      {/* The four list panels share the remaining height. */}
       <div className="grid min-h-0 flex-1 grid-cols-2 grid-rows-2 gap-4">
         <Panel
           title="Suggested questions"
           icon={<Lightbulb className="h-4 w-4 text-amber-400" />}
+          className="row-span-2"
         >
           {suggestions.length ? (
             <ul className="flex flex-col gap-2 py-1">
@@ -345,10 +368,7 @@ export function AnalysisPanels({
           )}
         </Panel>
 
-        <Panel
-          title="Assertions"
-          icon={<ListChecks className="h-4 w-4 text-others" />}
-        >
+        <Panel title="Assertions" icon={<ListChecks className="h-4 w-4 text-others" />}>
           {assertions.length ? (
             <ul className="flex flex-col gap-2 py-1">
               {assertions.map((a) => {
@@ -372,28 +392,6 @@ export function AnalysisPanels({
           )}
         </Panel>
 
-        <Panel title="Past topics" icon={<History className="h-4 w-4" />}>
-          {past.length ? (
-            <ul className="flex flex-col gap-2 py-1">
-              {[...past].reverse().map((t, i) => (
-                <li key={i} className="rounded-md border border-border/60 p-2">
-                  <div className="text-sm font-medium">{t.title}</div>
-                  {t.summary && (
-                    <div className="mt-0.5 text-xs text-muted-foreground">
-                      {t.summary}
-                    </div>
-                  )}
-                  <div className="mt-1 text-[10px] text-muted-foreground/60">
-                    {t.assertions?.length ?? 0} assertion
-                    {(t.assertions?.length ?? 0) === 1 ? "" : "s"}
-                  </div>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <Empty>Earlier topics will be archived here.</Empty>
-          )}
-        </Panel>
       </div>
     </div>
   );

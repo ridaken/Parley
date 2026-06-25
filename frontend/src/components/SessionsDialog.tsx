@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Pencil, Play, Trash2, Eye } from "lucide-react";
+import { Check, Download, Loader2, Pencil, Play, Trash2, Eye } from "lucide-react";
 
 import { MeetingService } from "../../bindings/github.com/tomvokac/parley";
 import type { Session } from "../../bindings/github.com/tomvokac/parley/internal/store/models";
@@ -31,17 +31,20 @@ export function SessionsDialog({
   onOpenChange,
   onView,
   onResume,
+  onExport,
   disabled,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   onView: (loaded: LoadedSession) => void;
   onResume: (id: number) => void;
+  onExport: (id: number) => Promise<string>;
   disabled: boolean; // a meeting is currently recording
 }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editTitle, setEditTitle] = useState("");
+  const [exportingId, setExportingId] = useState<number | null>(null);
 
   const refresh = async () => {
     const list = await MeetingService.ListSessions();
@@ -66,6 +69,15 @@ export function SessionsDialog({
   const remove = async (id: number) => {
     await MeetingService.DeleteSession(id);
     await refresh();
+  };
+
+  const exportMeeting = async (id: number) => {
+    setExportingId(id);
+    try {
+      await onExport(id);
+    } finally {
+      setExportingId(null);
+    }
   };
 
   const commitRename = async (id: number) => {
@@ -139,6 +151,20 @@ export function SessionsDialog({
 
                 <Button size="sm" variant="ghost" onClick={() => view(s.id)}>
                   <Eye className="h-4 w-4" /> View
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8"
+                  disabled={exportingId === s.id}
+                  onClick={() => exportMeeting(s.id)}
+                  title="Export Markdown"
+                >
+                  {exportingId === s.id ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="h-4 w-4" />
+                  )}
                 </Button>
                 <Button
                   size="sm"

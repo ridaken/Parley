@@ -57,6 +57,32 @@ func TestChunkerTranscribesAndTimesWindow(t *testing.T) {
 	}
 }
 
+func TestChunkerSplitsBacklogIntoWindowSizedRequests(t *testing.T) {
+	var calls atomic.Int32
+	srv := mockWhisper(t, "chunk", &calls)
+	defer srv.Close()
+
+	segs := make(chan Segment, 4)
+	c := NewChunker(NewClient(srv.URL), time.Second, func(s Segment) { segs <- s })
+
+	c.Feed(audio.You, loud(3*audio.SampleRate))
+	c.flush(context.Background())
+
+	if calls.Load() != 3 {
+		t.Fatalf("expected 3 bounded transcription calls, got %d", calls.Load())
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case seg := <-segs:
+			if seg.StartMs != int64(i*1000) || seg.EndMs != int64((i+1)*1000) {
+				t.Fatalf("segment %d timing = %d/%d", i, seg.StartMs, seg.EndMs)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("missing split segment")
+		}
+	}
+}
+
 func TestChunkerSkipsSilence(t *testing.T) {
 	var calls atomic.Int32
 	srv := mockWhisper(t, "should not happen", &calls)

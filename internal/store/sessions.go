@@ -31,6 +31,7 @@ type Session struct {
 	Title        string `json:"title"`
 	StartedAt    string `json:"startedAt"`
 	EndedAt      string `json:"endedAt"`
+	Status       string `json:"status"`
 	ProfileID    int64  `json:"profileID"`
 	AudioDir     string `json:"audioDir"`
 	SegmentCount int    `json:"segmentCount"` // populated by ListSessions for the browser
@@ -50,8 +51,8 @@ type SessionBundle struct {
 func (s *Store) CreateSession(title string, profileID int64, audioDir string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.db.Exec(
-		`INSERT INTO sessions (title, started_at, profile_id, audio_dir) VALUES (?, ?, ?, ?)`,
-		title, now, profileID, audioDir,
+		`INSERT INTO sessions (title, started_at, profile_id, audio_dir, status) VALUES (?, ?, ?, ?, ?)`,
+		title, now, profileID, audioDir, "recording",
 	)
 	if err != nil {
 		return 0, err
@@ -63,10 +64,16 @@ func (s *Store) CreateSession(title string, profileID int64, audioDir string) (i
 func (s *Store) EndSession(id int64, audioDir string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	if audioDir == "" {
-		_, err := s.db.Exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, id)
+		_, err := s.db.Exec(`UPDATE sessions SET ended_at = ?, status = 'complete' WHERE id = ?`, now, id)
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE sessions SET ended_at = ?, audio_dir = ? WHERE id = ?`, now, audioDir, id)
+	_, err := s.db.Exec(`UPDATE sessions SET ended_at = ?, audio_dir = ?, status = 'complete' WHERE id = ?`, now, audioDir, id)
+	return err
+}
+
+// SetSessionStatus records lifecycle state such as recording/finalizing/complete.
+func (s *Store) SetSessionStatus(id int64, status string) error {
+	_, err := s.db.Exec(`UPDATE sessions SET status = ? WHERE id = ?`, status, id)
 	return err
 }
 
@@ -121,7 +128,7 @@ func (s *Store) AddLiveNote(sessionID int64, note LiveNote) (LiveNote, error) {
 // ListSessions returns all sessions, newest first, with their segment counts.
 func (s *Store) ListSessions() ([]Session, error) {
 	rows, err := s.db.Query(`
-SELECT s.id, s.title, s.started_at, s.ended_at, s.profile_id, s.audio_dir,
+SELECT s.id, s.title, s.started_at, s.ended_at, s.status, s.profile_id, s.audio_dir,
        (SELECT COUNT(*) FROM transcript_segments t WHERE t.session_id = s.id)
 FROM sessions s
 ORDER BY s.started_at DESC`)
@@ -133,7 +140,7 @@ ORDER BY s.started_at DESC`)
 	sessions := []Session{}
 	for rows.Next() {
 		var x Session
-		if err := rows.Scan(&x.ID, &x.Title, &x.StartedAt, &x.EndedAt, &x.ProfileID, &x.AudioDir, &x.SegmentCount); err != nil {
+		if err := rows.Scan(&x.ID, &x.Title, &x.StartedAt, &x.EndedAt, &x.Status, &x.ProfileID, &x.AudioDir, &x.SegmentCount); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, x)
@@ -145,9 +152,9 @@ ORDER BY s.started_at DESC`)
 func (s *Store) GetSessionBundle(id int64) (SessionBundle, error) {
 	var b SessionBundle
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, profile_id, audio_dir, analysis_json FROM sessions WHERE id = ?`, id)
+		`SELECT id, title, started_at, ended_at, status, profile_id, audio_dir, analysis_json FROM sessions WHERE id = ?`, id)
 	if err := row.Scan(&b.Session.ID, &b.Session.Title, &b.Session.StartedAt, &b.Session.EndedAt,
-		&b.Session.ProfileID, &b.Session.AudioDir, &b.AnalysisJSON); err != nil {
+		&b.Session.Status, &b.Session.ProfileID, &b.Session.AudioDir, &b.AnalysisJSON); err != nil {
 		return SessionBundle{}, err
 	}
 

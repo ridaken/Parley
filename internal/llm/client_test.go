@@ -62,6 +62,64 @@ func TestCompleteParsesUsage(t *testing.T) {
 	}
 }
 
+func TestCompleteJSONRequestsJSONMode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_object" {
+			t.Fatalf("response_format not requested: %+v", req.ResponseFormat)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": `{"ok":true}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	got, err := NewClient(srv.URL, "", "m").CompleteJSON(context.Background(), []Message{{Role: "user", Content: "json"}})
+	if err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if got != `{"ok":true}` {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestCompleteJSONFallsBackWhenUnsupported(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if calls == 1 {
+			if req.ResponseFormat == nil {
+				t.Fatal("first call should request response_format")
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`unsupported response_format`))
+			return
+		}
+		if req.ResponseFormat != nil {
+			t.Fatalf("fallback call should omit response_format: %+v", req.ResponseFormat)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": `{"ok":true}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	got, err := NewClient(srv.URL, "", "m").CompleteJSON(context.Background(), []Message{{Role: "user", Content: "json"}})
+	if err != nil {
+		t.Fatalf("CompleteJSON fallback: %v", err)
+	}
+	if got != `{"ok":true}` || calls != 2 {
+		t.Fatalf("got %q after %d calls", got, calls)
+	}
+}
+
 func TestCompleteFallsBackToReasoningContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{

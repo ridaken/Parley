@@ -42,11 +42,16 @@ func NewClient(baseURL, apiKey, model string) *Client {
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
-	MaxTokens   int       `json:"max_tokens"`
-	Stream      bool      `json:"stream"`
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	Temperature    float64         `json:"temperature"`
+	MaxTokens      int             `json:"max_tokens"`
+	Stream         bool            `json:"stream"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+}
+
+type responseFormat struct {
+	Type string `json:"type"`
 }
 
 type Usage struct {
@@ -78,13 +83,32 @@ type responseMessage struct {
 
 // Complete sends the messages and returns the assistant's reply text.
 func (c *Client) Complete(ctx context.Context, messages []Message) (string, error) {
-	payload, err := json.Marshal(chatRequest{
+	return c.complete(ctx, messages, false)
+}
+
+// CompleteJSON asks compatible endpoints to constrain output to a JSON object.
+// Some local OpenAI-compatible servers reject response_format; in that case we
+// retry once without it so live analysis still works with those providers.
+func (c *Client) CompleteJSON(ctx context.Context, messages []Message) (string, error) {
+	reply, err := c.complete(ctx, messages, true)
+	if err != nil && responseFormatUnsupported(err) {
+		return c.complete(ctx, messages, false)
+	}
+	return reply, err
+}
+
+func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool) (string, error) {
+	reqBody := chatRequest{
 		Model:       c.model,
 		Messages:    messages,
 		Temperature: 0.2,
 		MaxTokens:   defaultMaxTokens,
 		Stream:      false,
-	})
+	}
+	if jsonMode {
+		reqBody.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
+	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
 	}
@@ -180,4 +204,14 @@ func textContent(v any) string {
 	default:
 		return fmt.Sprint(c)
 	}
+}
+
+func responseFormatUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "response_format") ||
+		strings.Contains(msg, "json_object") ||
+		strings.Contains(msg, "unsupported")
 }
