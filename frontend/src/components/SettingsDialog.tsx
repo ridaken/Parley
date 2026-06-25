@@ -32,6 +32,7 @@ const DEFAULTS: Settings = {
   llmBaseURL: "http://127.0.0.1:8080/v1",
   llmModel: "local-model",
   analysisIntervalSec: 15,
+  analysisTimeoutSec: 30,
   activeProfileID: 0,
   hasAPIKey: false,
   captureSources: [],
@@ -318,7 +319,7 @@ export function SettingsDialog({
           <div className="mt-1 border-t pt-3">
             <div className="mb-2 text-sm font-medium">Analysis</div>
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="interval">Analysis interval (seconds)</Label>
+              <Label htmlFor="interval">Next analysis after response (seconds)</Label>
               <Input
                 id="interval"
                 type="number"
@@ -326,6 +327,18 @@ export function SettingsDialog({
                 value={settings.analysisIntervalSec}
                 onChange={(e) =>
                   setSettings({ ...settings, analysisIntervalSec: Number(e.target.value) || 15 })
+                }
+              />
+            </div>
+            <div className="mt-3 flex flex-col gap-1.5">
+              <Label htmlFor="analysis-timeout">Analysis request timeout (seconds)</Label>
+              <Input
+                id="analysis-timeout"
+                type="number"
+                min={5}
+                value={settings.analysisTimeoutSec}
+                onChange={(e) =>
+                  setSettings({ ...settings, analysisTimeoutSec: Number(e.target.value) || 30 })
                 }
               />
             </div>

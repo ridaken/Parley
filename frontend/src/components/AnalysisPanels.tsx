@@ -1,6 +1,7 @@
 import {
   CheckSquare,
   Copy,
+  FileText,
   History,
   Lightbulb,
   ListChecks,
@@ -61,6 +62,31 @@ function Empty({ children }: { children: ReactNode }) {
     <div className="flex h-full items-center justify-center py-10 text-center text-xs text-muted-foreground/50">
       {children}
     </div>
+  );
+}
+
+function SummaryContent({ summary }: { summary: string }) {
+  const lines = summary
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return <Empty>The live summary will build as the discussion develops.</Empty>;
+  }
+
+  return (
+    <ul className="flex flex-col gap-2 py-1">
+      {lines.map((line, i) => {
+        const text = line.replace(/^[-*]\s+/, "");
+        return (
+          <li key={`${i}-${text}`} className="flex gap-2 text-sm leading-relaxed">
+            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-primary/70" />
+            <span>{text}</span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -185,6 +211,7 @@ export function AnalysisPanels({
   const suggestions = state.suggestions ?? [];
   const past = state.past ?? [];
   const actionItems = state.actionItems ?? [];
+  const summary = state.summary ?? "";
   const hasTopic = !!current?.title;
 
   const newSuggestions = useNewKeys(
@@ -229,6 +256,14 @@ export function AnalysisPanels({
             {idleHint}
           </div>
         )}
+      </Panel>
+
+      <Panel
+        title="Live summary"
+        icon={<FileText className="h-4 w-4 text-primary" />}
+        className="h-40 shrink-0"
+      >
+        <SummaryContent summary={summary} />
       </Panel>
 
       {/* The four list panels share the remaining height. */}

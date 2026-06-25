@@ -9,6 +9,7 @@ export {
 };
 
 export type {
+    AnalysisStatusEvent,
     LoadedSession,
     StatusEvent
 } from "./models.js";

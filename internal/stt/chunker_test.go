@@ -1,6 +1,7 @@
 package stt
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,81 @@ func TestChunkerSkipsSilence(t *testing.T) {
 	case seg := <-segs:
 		t.Fatalf("unexpected segment from silence: %+v", seg)
 	default:
+	}
+}
+
+func TestChunkerDoesNotOverlapSlowTranscriptions(t *testing.T) {
+	var current atomic.Int32
+	var maxConcurrent atomic.Int32
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		now := current.Add(1)
+		for {
+			max := maxConcurrent.Load()
+			if now <= max || maxConcurrent.CompareAndSwap(max, now) {
+				break
+			}
+		}
+		calls.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		current.Add(-1)
+		_ = json.NewEncoder(w).Encode(inferenceResponse{Text: "hello"})
+	}))
+	defer srv.Close()
+
+	c := NewChunker(NewClient(srv.URL), 20*time.Millisecond, func(Segment) {})
+	c.Start()
+	c.Feed(audio.You, loud(audio.SampleRate))
+	time.Sleep(30 * time.Millisecond)
+	c.Feed(audio.Others, loud(audio.SampleRate))
+	time.Sleep(250 * time.Millisecond)
+	c.Stop()
+
+	if calls.Load() < 2 {
+		t.Fatalf("expected at least 2 transcription calls, got %d", calls.Load())
+	}
+	if maxConcurrent.Load() != 1 {
+		t.Fatalf("transcriptions overlapped: max concurrent = %d", maxConcurrent.Load())
+	}
+}
+
+func TestChunkerContinuesAfterTranscriptionError(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(inferenceResponse{Text: "recovered"})
+	}))
+	defer srv.Close()
+
+	segs := make(chan Segment, 1)
+	c := NewChunker(NewClient(srv.URL), time.Hour, func(s Segment) { segs <- s })
+
+	c.Feed(audio.You, loud(audio.SampleRate))
+	c.flush(context.Background())
+	select {
+	case seg := <-segs:
+		t.Fatalf("failed transcription should not emit a segment: %+v", seg)
+	default:
+	}
+
+	c.Feed(audio.You, loud(audio.SampleRate))
+	c.flush(context.Background())
+	select {
+	case seg := <-segs:
+		if seg.Text != "recovered" {
+			t.Fatalf("unexpected recovered segment: %+v", seg)
+		}
+		if seg.StartMs != 1000 || seg.EndMs != 2000 {
+			t.Fatalf("timeline should advance past failed audio: start=%d end=%d", seg.StartMs, seg.EndMs)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("chunker did not recover after a transcription error")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
 	}
 }
 

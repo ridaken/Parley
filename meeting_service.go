@@ -16,6 +16,7 @@ import (
 
 	"github.com/tomvokac/parley/internal/analysis"
 	"github.com/tomvokac/parley/internal/audio"
+	meetingexport "github.com/tomvokac/parley/internal/export"
 	"github.com/tomvokac/parley/internal/llm"
 	"github.com/tomvokac/parley/internal/store"
 	"github.com/tomvokac/parley/internal/stt"
@@ -35,6 +36,13 @@ type StatusEvent struct {
 	ActiveSources []string `json:"activeSources"`
 }
 
+// AnalysisStatusEvent reports non-fatal analysis problems while capture keeps
+// running, such as an LLM request timeout or malformed model response.
+type AnalysisStatusEvent struct {
+	State   string `json:"state"` // ok | warning
+	Message string `json:"message"`
+}
+
 // MeetingService is the Wails-bound façade that drives capture + transcription.
 type MeetingService struct {
 	store *store.Store
@@ -46,7 +54,8 @@ type MeetingService struct {
 	server   *stt.Server
 	engine   *analysis.Engine
 
-	sessionID atomic.Int64 // active session row; 0 when not persisting
+	sessionID     atomic.Int64 // active session row; 0 when not persisting
+	lastSessionID atomic.Int64 // most recent persisted session, retained after Stop for export
 
 	recMu      sync.Mutex
 	recorders  map[audio.Source]*audio.MonoWAVWriter
@@ -253,13 +262,21 @@ func (m *MeetingService) Stop() error {
 // on-disk audio directory for this part, recording the id for live persistence.
 func (m *MeetingService) openSession(resumeID int64) {
 	var profileID int64
+	var profile store.Profile
+	var hasProfile bool
 	if s, err := m.store.GetSettings(); err == nil {
 		profileID = s.ActiveProfileID
+		if profileID != 0 {
+			if p, err := m.store.GetProfile(profileID); err == nil {
+				profile = p
+				hasProfile = true
+			}
+		}
 	}
 
 	sessionID := resumeID
 	if sessionID == 0 {
-		title := "Meeting " + time.Now().Format("Jan 2 2006, 3:04 PM")
+		title := sessionTitle(profile, hasProfile, time.Now())
 		id, err := m.store.CreateSession(title, profileID, "")
 		if err != nil {
 			log.Printf("[session] could not create session: %v", err)
@@ -267,6 +284,9 @@ func (m *MeetingService) openSession(resumeID int64) {
 		sessionID = id
 	}
 	m.sessionID.Store(sessionID)
+	if sessionID != 0 {
+		m.lastSessionID.Store(sessionID)
+	}
 
 	// Each Start/Resume writes audio to its own part directory so resumed
 	// meetings don't clobber the earlier part's recordings.
@@ -281,6 +301,15 @@ func (m *MeetingService) openSession(resumeID int64) {
 	if sessionID != 0 {
 		_ = m.store.SetSessionAudioDir(sessionID, m.sessionDir)
 	}
+}
+
+func sessionTitle(profile store.Profile, hasProfile bool, now time.Time) string {
+	if hasProfile {
+		if name := strings.TrimSpace(profile.Name); name != "" {
+			return name
+		}
+	}
+	return "Meeting " + now.Format("Jan 2 2006, 3:04 PM")
 }
 
 // closeSession stamps the session's end time and stops live persistence.
@@ -367,16 +396,20 @@ func (m *MeetingService) startEngine(resumeID int64) {
 	apiKey, _ := m.store.GetConnectionAPIKey(conn.ID)
 	log.Printf("[analysis] using LLM connection %q (%s, model %s)", conn.Name, conn.BaseURL, conn.Model)
 	client := llm.NewClient(conn.BaseURL, apiKey, conn.Model)
-	interval := time.Duration(settings.AnalysisIntervalSec) * time.Second
+	delay := time.Duration(settings.AnalysisIntervalSec) * time.Second
+	timeout := time.Duration(settings.AnalysisTimeoutSec) * time.Second
 	sessionID := m.sessionID.Load()
 
-	m.engine = analysis.NewEngine(client, interval, bg, func(s analysis.State) {
+	m.engine = analysis.NewEngineWithTimeout(client, delay, timeout, bg, func(s analysis.State) {
+		emitAnalysisStatus("ok", "")
 		application.Get().Event.Emit("analysis", s)
 		if sessionID != 0 {
 			if data, err := json.Marshal(s); err == nil {
 				_ = m.store.SaveAnalysis(sessionID, string(data))
 			}
 		}
+	}, func(msg string) {
+		emitAnalysisStatus("warning", msg)
 	})
 
 	if resumeID != 0 {
@@ -467,6 +500,60 @@ func (m *MeetingService) LoadSession(id int64) (LoadedSession, error) {
 	return out, nil
 }
 
+// ExportMarkdown saves the active or selected meeting's notes as a Markdown file.
+// Pass sessionID=0 to export the currently running session.
+func (m *MeetingService) ExportMarkdown(sessionID int64) (string, error) {
+	sessionID = m.exportSessionID(sessionID)
+	if sessionID == 0 {
+		return "", fmt.Errorf("no meeting is available to export")
+	}
+	b, err := m.store.GetSessionBundle(sessionID)
+	if err != nil {
+		return "", err
+	}
+	filename := ""
+	if strings.TrimSpace(b.Session.Title) != "" {
+		filename = sanitizeFilename(b.Session.Title)
+	}
+	if filename == "" {
+		filename = fmt.Sprintf("meeting-%d", sessionID)
+	}
+	if !strings.HasSuffix(strings.ToLower(filename), ".md") {
+		filename += ".md"
+	}
+	app := application.Get()
+	if app == nil {
+		return "", fmt.Errorf("export requires the Wails application runtime")
+	}
+	path, err := app.Dialog.SaveFileWithOptions(&application.SaveFileDialogOptions{
+		Title:    "Export meeting notes",
+		Filename: filename,
+		Filters: []application.FileFilter{
+			{DisplayName: "Markdown", Pattern: "*.md"},
+		},
+	}).PromptForSingleSelection()
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", nil
+	}
+	if err := os.WriteFile(path, []byte(meetingexport.Markdown(b)), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (m *MeetingService) exportSessionID(requested int64) int64 {
+	if requested != 0 {
+		return requested
+	}
+	if id := m.sessionID.Load(); id != 0 {
+		return id
+	}
+	return m.lastSessionID.Load()
+}
+
 // RenameSession changes a saved meeting's title.
 func (m *MeetingService) RenameSession(id int64, title string) error {
 	return m.store.SetSessionTitle(id, strings.TrimSpace(title))
@@ -497,6 +584,12 @@ func emitStatus(state, message string, _ []audio.Source) {
 // whether a microphone is among them.
 func emitListening(active []audio.Source, hasMic bool) {
 	emit("listening", "Listening", active, hasMic)
+}
+
+func emitAnalysisStatus(state, message string) {
+	if app := application.Get(); app != nil {
+		app.Event.Emit("analysisStatus", AnalysisStatusEvent{State: state, Message: message})
+	}
 }
 
 func emit(state, message string, active []audio.Source, mic bool) {

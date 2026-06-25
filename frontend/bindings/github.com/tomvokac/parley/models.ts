@@ -12,6 +12,18 @@ import * as store$0 from "./internal/store/models.js";
 import * as stt$0 from "./internal/stt/models.js";
 
 /**
+ * AnalysisStatusEvent reports non-fatal analysis problems while capture keeps
+ * running, such as an LLM request timeout or malformed model response.
+ */
+export interface AnalysisStatusEvent {
+    /**
+     * ok | warning
+     */
+    "state": string;
+    "message": string;
+}
+
+/**
  * LoadedSession is a saved meeting's full state, returned to the frontend so it
  * can repopulate the transcript and analysis panels (read-only view or resume).
  */

@@ -2,6 +2,7 @@ package stt
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
@@ -33,7 +34,6 @@ type Chunker struct {
 
 	cancel context.CancelFunc
 	done   chan struct{}
-	wg     sync.WaitGroup
 }
 
 type srcState struct {
@@ -77,7 +77,6 @@ func (c *Chunker) Stop() {
 		c.cancel()
 		<-c.done
 	}
-	c.wg.Wait()
 }
 
 func (c *Chunker) loop(ctx context.Context) {
@@ -87,25 +86,20 @@ func (c *Chunker) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Final partial flush must outlive the cancelled ctx, otherwise the
-			// last chunk's transcription request is aborted before it runs and
-			// the tail of the meeting is lost. Wait for the spawned transcription
-			// goroutines before cancelling, so fctx stays live for the request.
 			fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			c.flush(fctx)
-			c.wg.Wait()
 			cancel()
 			return
 		case <-t.C:
-			c.flush(ctx)
+			c.flush(context.Background())
 		}
 	}
 }
 
 type flushJob struct {
-	src              audio.Source
-	samples          []int16
-	startMs, endMs   int64
+	src            audio.Source
+	samples        []int16
+	startMs, endMs int64
 }
 
 func (c *Chunker) flush(ctx context.Context) {
@@ -129,15 +123,19 @@ func (c *Chunker) flush(ctx context.Context) {
 		if peakAmplitude(j.samples) < silenceThreshold {
 			continue // skip silent windows
 		}
-		c.wg.Add(1)
-		go func(j flushJob) {
-			defer c.wg.Done()
-			text, err := c.client.Transcribe(ctx, audio.EncodeMonoWAV(audio.SampleRate, j.samples))
-			if err != nil || text == "" {
-				return
-			}
-			c.onSegment(Segment{Source: j.src, Text: text, StartMs: j.startMs, EndMs: j.endMs})
-		}(j)
+		start := time.Now()
+		text, err := c.client.Transcribe(ctx, audio.EncodeMonoWAV(audio.SampleRate, j.samples))
+		if err != nil {
+			log.Printf("[stt] transcribe failed source=%s start=%dms end=%dms duration=%s: %v",
+				j.src, j.startMs, j.endMs, time.Since(start).Round(time.Millisecond), err)
+			continue
+		}
+		if text == "" {
+			log.Printf("[stt] transcribe empty source=%s start=%dms end=%dms duration=%s",
+				j.src, j.startMs, j.endMs, time.Since(start).Round(time.Millisecond))
+			continue
+		}
+		c.onSegment(Segment{Source: j.src, Text: text, StartMs: j.startMs, EndMs: j.endMs})
 	}
 }
 

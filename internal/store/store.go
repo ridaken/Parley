@@ -41,6 +41,7 @@ type Settings struct {
 	LLMBaseURL          string          `json:"llmBaseURL"`
 	LLMModel            string          `json:"llmModel"`
 	AnalysisIntervalSec int             `json:"analysisIntervalSec"`
+	AnalysisTimeoutSec  int             `json:"analysisTimeoutSec"`
 	ActiveProfileID     int64           `json:"activeProfileID"`
 	HasAPIKey           bool            `json:"hasAPIKey"`
 	CaptureSources      []CaptureSource `json:"captureSources"`
@@ -173,6 +174,9 @@ CREATE TABLE IF NOT EXISTS llm_connections (
 	if err := s.addColumn("settings", "active_llm_connection_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := s.addColumn("settings", "analysis_timeout_sec", "INTEGER NOT NULL DEFAULT 30"); err != nil {
+		return err
+	}
 	return s.seedLLMConnections()
 }
 
@@ -226,9 +230,15 @@ func (s *Store) addColumn(table, column, decl string) error {
 func (s *Store) GetSettings() (Settings, error) {
 	var st Settings
 	var sourcesJSON string
-	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, active_profile_id, capture_sources, stt_base_url, whisper_model, active_llm_connection_id FROM settings WHERE id = 1`)
-	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.ActiveProfileID, &sourcesJSON, &st.SttBaseURL, &st.WhisperModel, &st.ActiveLLMConnectionID); err != nil {
+	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, analysis_timeout_sec, active_profile_id, capture_sources, stt_base_url, whisper_model, active_llm_connection_id FROM settings WHERE id = 1`)
+	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.AnalysisTimeoutSec, &st.ActiveProfileID, &sourcesJSON, &st.SttBaseURL, &st.WhisperModel, &st.ActiveLLMConnectionID); err != nil {
 		return Settings{}, err
+	}
+	if st.AnalysisIntervalSec <= 0 {
+		st.AnalysisIntervalSec = 15
+	}
+	if st.AnalysisTimeoutSec <= 0 {
+		st.AnalysisTimeoutSec = 30
 	}
 	if st.WhisperModel == "" {
 		st.WhisperModel = "ggml-small.en-q5_1.bin"
@@ -254,8 +264,8 @@ func (s *Store) SaveSettings(st Settings) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, active_profile_id = ?, capture_sources = ?, stt_base_url = ?, whisper_model = ?, active_llm_connection_id = ? WHERE id = 1`,
-		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.ActiveProfileID, string(sourcesJSON), st.SttBaseURL, st.WhisperModel, st.ActiveLLMConnectionID,
+		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, analysis_timeout_sec = ?, active_profile_id = ?, capture_sources = ?, stt_base_url = ?, whisper_model = ?, active_llm_connection_id = ? WHERE id = 1`,
+		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.AnalysisTimeoutSec, st.ActiveProfileID, string(sourcesJSON), st.SttBaseURL, st.WhisperModel, st.ActiveLLMConnectionID,
 	)
 	return err
 }
