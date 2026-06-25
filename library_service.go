@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/tomvokac/parley/internal/condense"
+	"github.com/tomvokac/parley/internal/diagnostics"
 	"github.com/tomvokac/parley/internal/llm"
 	"github.com/tomvokac/parley/internal/store"
 )
@@ -42,6 +44,24 @@ func (l *LibraryService) TestConnection() error {
 		return err
 	}
 	return l.testConn(conn)
+}
+
+// LogFrontendError records a React/WebView exception in the local diagnostics
+// log according to the current logging level.
+func (l *LibraryService) LogFrontendError(message, source, stack string) error {
+	level := diagnostics.LevelTrace
+	if s, err := l.store.GetSettings(); err == nil {
+		level = s.LoggingLevel
+	}
+	if err := diagnostics.LogFrontendError(dataDir(), level, diagnostics.FrontendError{
+		Message: message,
+		Source:  source,
+		Stack:   stack,
+	}); err != nil {
+		log.Printf("[diagnostics] write frontend error: %v", err)
+		return err
+	}
+	return nil
 }
 
 // ListLLMConnections returns all saved LLM connections (newest-updated first).

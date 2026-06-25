@@ -323,7 +323,7 @@ func TestFeedThenAnalyzeEmitsAndThenSkipsWithoutNewContent(t *testing.T) {
 func TestAnalyzeFailureDoesNotConsumeTranscript(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
+		if calls.Add(1) <= 2 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{"message": map[string]any{"content": "{not valid json"}}},
 			})
@@ -368,6 +368,79 @@ func TestAnalyzeFailureDoesNotConsumeTranscript(t *testing.T) {
 	}
 }
 
+func TestAnalyzeRetriesMalformedModelResponse(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{"message": map[string]any{"content": "The user wants me to update notes. I should output JSON."}}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": `{"currentTopicTitle":"Recovered","currentTopicSummary":"Retry worked.","meetingSummary":"- Retry worked.","topicChanged":false,"assertions":[],"suggestions":[]}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	emits := make(chan State, 1)
+	eng := NewEngine(llm.NewClient(srv.URL, "", "m"), 3*time.Second, Context{}, func(s State) { emits <- s })
+	if err := eng.analyze(context.Background(), "Others: discuss retry\n", 1, priorView{}, nil); err != nil {
+		t.Fatalf("analyze should recover on retry: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected malformed response + retry, got %d calls", calls.Load())
+	}
+	select {
+	case s := <-emits:
+		if s.Current.Title != "Recovered" {
+			t.Fatalf("state not recovered from retry: %+v", s)
+		}
+	default:
+		t.Fatal("expected recovered state emit")
+	}
+}
+
+type captureFailureLogger struct {
+	events []AnalysisFailure
+}
+
+func (l *captureFailureLogger) LogAnalysisFailure(f AnalysisFailure) {
+	l.events = append(l.events, f)
+}
+
+func TestAnalysisFailureLoggerReceivesRequestResponseAndSessionContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "no JSON here"}}},
+		})
+	}))
+	defer srv.Close()
+
+	logger := &captureFailureLogger{}
+	eng := NewEngineWithTimeout(llm.NewClient(srv.URL, "", "m"), 3*time.Second, time.Second, Context{}, nil, nil)
+	eng.SetFailureLogger(DiagnosticMeta{
+		SessionID:      42,
+		SessionTitle:   "Real meeting",
+		ConnectionName: "Local",
+		BaseURL:        srv.URL,
+		Model:          "m",
+	}, logger)
+	eng.Feed("Others", "line")
+	eng.analyzeOnce(context.Background())
+
+	if len(logger.events) != 1 {
+		t.Fatalf("logged %d events, want 1", len(logger.events))
+	}
+	ev := logger.events[0]
+	if ev.SessionID != 42 || ev.SessionTitle != "Real meeting" || ev.ConnectionName != "Local" {
+		t.Fatalf("missing session/provider context: %+v", ev)
+	}
+	if ev.Kind != "parse" || ev.Response == "" || len(ev.Request) == 0 {
+		t.Fatalf("missing parse diagnostics: %+v", ev)
+	}
+}
+
 func TestAnalyzeOnceTimesOutAndReportsStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(200 * time.Millisecond)
@@ -399,6 +472,31 @@ func TestAnalyzeOnceTimesOutAndReportsStatus(t *testing.T) {
 	}
 	if eng.analyzedLen != 0 {
 		t.Fatalf("timed-out analysis consumed transcript: %d", eng.analyzedLen)
+	}
+}
+
+func TestFlushAnalyzesPendingTranscript(t *testing.T) {
+	content := `{"currentTopicTitle":"Final","currentTopicSummary":"Final line analyzed.","meetingSummary":"- Final line analyzed.","topicChanged":false,"assertions":[],"suggestions":[]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": content}}},
+		})
+	}))
+	defer srv.Close()
+
+	emits := make(chan State, 1)
+	eng := NewEngineWithTimeout(llm.NewClient(srv.URL, "", "m"), 3*time.Second, time.Second, Context{}, func(s State) {
+		emits <- s
+	}, nil)
+	eng.Feed("Others", "final line")
+	eng.Flush(context.Background())
+	select {
+	case s := <-emits:
+		if s.Current.Title != "Final" || eng.analyzedLen != 1 {
+			t.Fatalf("flush did not analyze pending transcript: state=%+v analyzedLen=%d", s, eng.analyzedLen)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("flush did not emit")
 	}
 }
 

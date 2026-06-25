@@ -26,6 +26,13 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 
 const DEFAULTS: Settings = {
@@ -33,6 +40,7 @@ const DEFAULTS: Settings = {
   llmModel: "local-model",
   analysisIntervalSec: 15,
   analysisTimeoutSec: 30,
+  loggingLevel: "trace",
   activeProfileID: 0,
   hasAPIKey: false,
   captureSources: [],
@@ -341,6 +349,22 @@ export function SettingsDialog({
                   setSettings({ ...settings, analysisTimeoutSec: Number(e.target.value) || 30 })
                 }
               />
+            </div>
+            <div className="mt-3 flex flex-col gap-1.5">
+              <Label htmlFor="logging-level">Diagnostic logging</Label>
+              <Select
+                value={settings.loggingLevel || "trace"}
+                onValueChange={(v) => setSettings({ ...settings, loggingLevel: v })}
+              >
+                <SelectTrigger id="logging-level">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="trace">Trace</SelectItem>
+                  <SelectItem value="error">Error</SelectItem>
+                  <SelectItem value="none">None</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           </div>
 

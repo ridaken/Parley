@@ -17,15 +17,19 @@ func TestSettingsDefaultsAndUpdate(t *testing.T) {
 	if got.LLMBaseURL == "" || got.AnalysisIntervalSec == 0 || got.AnalysisTimeoutSec == 0 {
 		t.Fatalf("expected sane defaults, got %+v", got)
 	}
+	if got.LoggingLevel != "trace" {
+		t.Fatalf("logging level default = %q, want trace", got.LoggingLevel)
+	}
 
 	got.LLMModel = "qwen2.5"
 	got.AnalysisIntervalSec = 20
 	got.AnalysisTimeoutSec = 45
+	got.LoggingLevel = "error"
 	if err := s.SaveSettings(got); err != nil {
 		t.Fatalf("SaveSettings: %v", err)
 	}
 	again, _ := s.GetSettings()
-	if again.LLMModel != "qwen2.5" || again.AnalysisIntervalSec != 20 || again.AnalysisTimeoutSec != 45 {
+	if again.LLMModel != "qwen2.5" || again.AnalysisIntervalSec != 20 || again.AnalysisTimeoutSec != 45 || again.LoggingLevel != "error" {
 		t.Fatalf("settings not persisted: %+v", again)
 	}
 }

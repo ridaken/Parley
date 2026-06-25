@@ -16,6 +16,7 @@ import (
 
 	"github.com/tomvokac/parley/internal/analysis"
 	"github.com/tomvokac/parley/internal/audio"
+	"github.com/tomvokac/parley/internal/diagnostics"
 	meetingexport "github.com/tomvokac/parley/internal/export"
 	"github.com/tomvokac/parley/internal/llm"
 	"github.com/tomvokac/parley/internal/store"
@@ -30,10 +31,43 @@ const (
 
 // StatusEvent is broadcast whenever the capture/transcription state changes.
 type StatusEvent struct {
-	State         string   `json:"state"` // idle | starting | listening | error
+	State         string   `json:"state"` // idle | starting | listening | finalizing | error
 	Message       string   `json:"message"`
 	MicAvailable  bool     `json:"micAvailable"`
 	ActiveSources []string `json:"activeSources"`
+}
+
+// analysisDiagLogger adapts analysis failures to Parley's local diagnostics
+// files while reading the current logging level from settings each time.
+type analysisDiagLogger struct {
+	store *store.Store
+}
+
+func (l analysisDiagLogger) LogAnalysisFailure(f analysis.AnalysisFailure) {
+	level := diagnostics.LevelTrace
+	if s, err := l.store.GetSettings(); err == nil {
+		level = s.LoggingLevel
+	}
+	err := diagnostics.LogAnalysisFailure(dataDir(), level, diagnostics.AnalysisFailure{
+		Timestamp:      f.Timestamp,
+		SessionID:      f.SessionID,
+		SessionTitle:   f.SessionTitle,
+		ConnectionName: f.ConnectionName,
+		BaseURL:        f.BaseURL,
+		Model:          f.Model,
+		Kind:           f.Kind,
+		Error:          f.Error,
+		Attempt:        f.Attempt,
+		MaxAttempts:    f.MaxAttempts,
+		SkippedWindow:  f.SkippedWindow,
+		TargetLen:      f.TargetLen,
+		ElapsedMs:      f.Elapsed.Milliseconds(),
+		Request:        f.Request,
+		Response:       f.Response,
+	})
+	if err != nil {
+		log.Printf("[diagnostics] write analysis failure: %v", err)
+	}
 }
 
 // AnalysisStatusEvent reports non-fatal analysis problems while capture keeps
@@ -236,9 +270,20 @@ func (m *MeetingService) Stop() error {
 		return nil
 	}
 	// Order matters: stop feeds, flush+transcribe remaining audio, then kill server.
-	m.capturer.Stop()
-	m.chunker.Stop()
+	emitStatus("finalizing", "Finalizing meeting…", nil)
+	if id := m.sessionID.Load(); id != 0 {
+		_ = m.store.SetSessionStatus(id, "finalizing")
+	}
+	if m.capturer != nil {
+		m.capturer.Stop()
+	}
+	if m.chunker != nil {
+		m.chunker.StopWithTimeout(5 * time.Minute)
+	}
 	if m.engine != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*m.engineTimeout())
+		m.engine.Flush(ctx)
+		cancel()
 		m.engine.Stop()
 		m.engine = nil
 	}
@@ -256,6 +301,22 @@ func (m *MeetingService) Stop() error {
 	m.running = false
 	emitStatus("idle", "Stopped", nil)
 	return nil
+}
+
+// ServiceShutdown is called by Wails when the app is exiting. It gives Parley a
+// best-effort chance to stop capture, drain final transcription/analysis, and
+// terminate the local whisper subprocess.
+func (m *MeetingService) ServiceShutdown() error {
+	log.Println("[meeting] service shutdown")
+	return m.Stop()
+}
+
+func (m *MeetingService) engineTimeout() time.Duration {
+	settings, err := m.store.GetSettings()
+	if err != nil || settings.AnalysisTimeoutSec <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(settings.AnalysisTimeoutSec) * time.Second
 }
 
 // openSession creates (or reuses, for resume) the persisted session and the
@@ -300,6 +361,7 @@ func (m *MeetingService) openSession(resumeID int64) {
 	}
 	if sessionID != 0 {
 		_ = m.store.SetSessionAudioDir(sessionID, m.sessionDir)
+		_ = m.store.SetSessionStatus(sessionID, "recording")
 	}
 }
 
@@ -411,6 +473,19 @@ func (m *MeetingService) startEngine(resumeID int64) {
 	}, func(msg string) {
 		emitAnalysisStatus("warning", msg)
 	})
+	title := ""
+	if sessionID != 0 {
+		if b, err := m.store.GetSessionBundle(sessionID); err == nil {
+			title = b.Session.Title
+		}
+	}
+	m.engine.SetFailureLogger(analysis.DiagnosticMeta{
+		SessionID:      sessionID,
+		SessionTitle:   title,
+		ConnectionName: conn.Name,
+		BaseURL:        conn.BaseURL,
+		Model:          conn.Model,
+	}, analysisDiagLogger{store: m.store})
 
 	if resumeID != 0 {
 		m.restoreEngine(resumeID)

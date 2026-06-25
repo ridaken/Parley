@@ -39,7 +39,7 @@ export interface LoadedSession {
  */
 export interface StatusEvent {
     /**
-     * idle | starting | listening | error
+     * idle | starting | listening | finalizing | error
      */
     "state": string;
     "message": string;

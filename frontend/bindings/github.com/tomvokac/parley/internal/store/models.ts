@@ -81,6 +81,7 @@ export interface Session {
     "title": string;
     "startedAt": string;
     "endedAt": string;
+    "status": string;
     "profileID": number;
     "audioDir": string;
 
@@ -98,6 +99,11 @@ export interface Settings {
     "llmModel": string;
     "analysisIntervalSec": number;
     "analysisTimeoutSec": number;
+
+    /**
+     * "trace" | "error" | "none"
+     */
+    "loggingLevel": string;
     "activeProfileID": number;
     "hasAPIKey": boolean;
     "captureSources": CaptureSource[] | null;

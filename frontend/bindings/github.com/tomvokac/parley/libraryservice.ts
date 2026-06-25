@@ -61,6 +61,14 @@ export function ListProfiles(): $CancellablePromise<store$0.Profile[] | null> {
 }
 
 /**
+ * LogFrontendError records a React/WebView exception in the local diagnostics
+ * log according to the current logging level.
+ */
+export function LogFrontendError(message: string, source: string, stack: string): $CancellablePromise<void> {
+    return $Call.ByID(3397018678, message, source, stack);
+}
+
+/**
  * SaveLLMConnection inserts or updates a connection and returns the saved row.
  */
 export function SaveLLMConnection(c: store$0.LLMConnection): $CancellablePromise<store$0.LLMConnection> {

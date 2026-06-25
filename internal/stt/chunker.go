@@ -29,8 +29,9 @@ type Chunker struct {
 	window    time.Duration
 	onSegment func(Segment)
 
-	mu  sync.Mutex
-	buf map[audio.Source]*srcState
+	mu                sync.Mutex
+	buf               map[audio.Source]*srcState
+	finalFlushTimeout time.Duration
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -73,7 +74,18 @@ func (c *Chunker) Start() {
 
 // Stop ends the loop and waits for in-flight transcriptions.
 func (c *Chunker) Stop() {
+	c.StopWithTimeout(30 * time.Second)
+}
+
+// StopWithTimeout ends the loop and gives the final flush the supplied deadline.
+func (c *Chunker) StopWithTimeout(timeout time.Duration) {
 	if c.cancel != nil {
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		c.mu.Lock()
+		c.finalFlushTimeout = timeout
+		c.mu.Unlock()
 		c.cancel()
 		<-c.done
 	}
@@ -86,7 +98,13 @@ func (c *Chunker) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			c.mu.Lock()
+			timeout := c.finalFlushTimeout
+			c.mu.Unlock()
+			if timeout <= 0 {
+				timeout = 30 * time.Second
+			}
+			fctx, cancel := context.WithTimeout(context.Background(), timeout)
 			c.flush(fctx)
 			cancel()
 			return
@@ -104,37 +122,57 @@ type flushJob struct {
 
 func (c *Chunker) flush(ctx context.Context) {
 	var jobs []flushJob
+	maxSamples := int(c.window * time.Duration(audio.SampleRate) / time.Second)
+	if maxSamples <= 0 {
+		maxSamples = audio.SampleRate
+	}
 
 	c.mu.Lock()
 	for src, st := range c.buf {
 		if len(st.pending) == 0 {
 			continue
 		}
-		samples := st.pending
-		st.pending = nil
-		durMs := int64(len(samples)) * 1000 / int64(audio.SampleRate)
-		start := st.flushedMs
-		st.flushedMs += durMs
-		jobs = append(jobs, flushJob{src: src, samples: samples, startMs: start, endMs: start + durMs})
+		for len(st.pending) > 0 {
+			n := len(st.pending)
+			if n > maxSamples {
+				n = maxSamples
+			}
+			samples := append([]int16(nil), st.pending[:n]...)
+			st.pending = st.pending[n:]
+			durMs := int64(len(samples)) * 1000 / int64(audio.SampleRate)
+			start := st.flushedMs
+			st.flushedMs += durMs
+			jobs = append(jobs, flushJob{src: src, samples: samples, startMs: start, endMs: start + durMs})
+		}
 	}
 	c.mu.Unlock()
 
 	for _, j := range jobs {
+		select {
+		case <-ctx.Done():
+			log.Printf("[stt] final flush stopped before source=%s start=%dms end=%dms: %v",
+				j.src, j.startMs, j.endMs, ctx.Err())
+			return
+		default:
+		}
 		if peakAmplitude(j.samples) < silenceThreshold {
 			continue // skip silent windows
 		}
 		start := time.Now()
+		audioMs := j.endMs - j.startMs
 		text, err := c.client.Transcribe(ctx, audio.EncodeMonoWAV(audio.SampleRate, j.samples))
 		if err != nil {
-			log.Printf("[stt] transcribe failed source=%s start=%dms end=%dms duration=%s: %v",
-				j.src, j.startMs, j.endMs, time.Since(start).Round(time.Millisecond), err)
+			log.Printf("[stt] transcribe failed source=%s start=%dms end=%dms audio=%dms duration=%s: %v",
+				j.src, j.startMs, j.endMs, audioMs, time.Since(start).Round(time.Millisecond), err)
 			continue
 		}
 		if text == "" {
-			log.Printf("[stt] transcribe empty source=%s start=%dms end=%dms duration=%s",
-				j.src, j.startMs, j.endMs, time.Since(start).Round(time.Millisecond))
+			log.Printf("[stt] transcribe empty source=%s start=%dms end=%dms audio=%dms duration=%s",
+				j.src, j.startMs, j.endMs, audioMs, time.Since(start).Round(time.Millisecond))
 			continue
 		}
+		log.Printf("[stt] transcribed source=%s start=%dms end=%dms audio=%dms duration=%s",
+			j.src, j.startMs, j.endMs, audioMs, time.Since(start).Round(time.Millisecond))
 		c.onSegment(Segment{Source: j.src, Text: text, StartMs: j.startMs, EndMs: j.endMs})
 	}
 }

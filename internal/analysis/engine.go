@@ -103,6 +103,8 @@ type Engine struct {
 	analyzedLen int
 	liveNotes   []LiveNote
 	failures    int
+	meta        DiagnosticMeta
+	logger      FailureLogger
 
 	busy   atomic.Bool
 	cancel context.CancelFunc
@@ -111,6 +113,41 @@ type Engine struct {
 
 const defaultAnalysisTimeout = 30 * time.Second
 const maxConsecutiveAnalysisFailures = 3
+
+// DiagnosticMeta describes the meeting/provider context attached to structured
+// failure logs.
+type DiagnosticMeta struct {
+	SessionID      int64
+	SessionTitle   string
+	ConnectionName string
+	BaseURL        string
+	Model          string
+}
+
+// AnalysisFailure is emitted to the optional FailureLogger whenever a live
+// analysis pass fails. Request/response are populated for trace-level logging;
+// the concrete logger decides how much to persist.
+type AnalysisFailure struct {
+	Timestamp      time.Time
+	SessionID      int64
+	SessionTitle   string
+	ConnectionName string
+	BaseURL        string
+	Model          string
+	Kind           string
+	Error          string
+	Attempt        int
+	MaxAttempts    int
+	SkippedWindow  bool
+	TargetLen      int
+	Elapsed        time.Duration
+	Request        []llm.Message
+	Response       string
+}
+
+type FailureLogger interface {
+	LogAnalysisFailure(AnalysisFailure)
+}
 
 // NewEngine creates an engine. emit is called with each new analysis State.
 func NewEngine(client *llm.Client, interval time.Duration, bg Context, emit func(State)) *Engine {
@@ -127,6 +164,14 @@ func NewEngineWithTimeout(client *llm.Client, delay, timeout time.Duration, bg C
 		timeout = defaultAnalysisTimeout
 	}
 	return &Engine{client: client, delay: delay, timeout: timeout, bg: bg, emit: emit, statusUpdate: statusUpdate}
+}
+
+// SetFailureLogger attaches structured diagnostics to later analysis attempts.
+func (e *Engine) SetFailureLogger(meta DiagnosticMeta, logger FailureLogger) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.meta = meta
+	e.logger = logger
 }
 
 // Feed adds a transcribed line.
@@ -198,6 +243,22 @@ func (e *Engine) Stop() {
 	}
 }
 
+// Flush waits for any in-flight request and then analyzes pending transcript
+// once. Stop uses this after final transcription drains so late-arriving lines
+// are reflected in the saved meeting before it is marked complete.
+func (e *Engine) Flush(ctx context.Context) {
+	t := time.NewTicker(25 * time.Millisecond)
+	defer t.Stop()
+	for e.busy.Load() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+	e.analyzeOnce(ctx)
+}
+
 func (e *Engine) loop(ctx context.Context) {
 	defer close(e.done)
 	for {
@@ -264,13 +325,47 @@ func (e *Engine) analyzeOnce(ctx context.Context) {
 
 func (e *Engine) handleAnalysisError(err error, targetLen int) {
 	msg := fmt.Sprintf("Live analysis did not complete: %v", err)
-	if e.recordAnalysisFailure(targetLen) {
+	attempt, skipped := e.recordAnalysisFailure(targetLen)
+	if skipped {
 		msg = fmt.Sprintf("%s. Skipped that transcript window after %d consecutive failures so live analysis can continue with newer transcript.", msg, maxConsecutiveAnalysisFailures)
 	}
+	e.logAnalysisFailure(err, targetLen, attempt, skipped)
 	log.Printf("[analysis] %s", msg)
 	if e.statusUpdate != nil {
 		e.statusUpdate(msg)
 	}
+}
+
+func (e *Engine) logAnalysisFailure(err error, targetLen, attempt int, skipped bool) {
+	e.mu.Lock()
+	meta := e.meta
+	logger := e.logger
+	e.mu.Unlock()
+	if logger == nil {
+		return
+	}
+	event := AnalysisFailure{
+		Timestamp:      time.Now().UTC(),
+		SessionID:      meta.SessionID,
+		SessionTitle:   meta.SessionTitle,
+		ConnectionName: meta.ConnectionName,
+		BaseURL:        meta.BaseURL,
+		Model:          meta.Model,
+		Kind:           "analysis",
+		Error:          err.Error(),
+		Attempt:        attempt,
+		MaxAttempts:    maxConsecutiveAnalysisFailures,
+		SkippedWindow:  skipped,
+		TargetLen:      targetLen,
+	}
+	var runErr *analysisRunError
+	if asAnalysisRunError(err, &runErr) {
+		event.Kind = runErr.kind
+		event.Request = runErr.messages
+		event.Response = runErr.reply
+		event.Elapsed = runErr.elapsed
+	}
+	logger.LogAnalysisFailure(event)
 }
 
 type analysisJob struct {
@@ -352,13 +447,33 @@ func (e *Engine) analyze(ctx context.Context, window string, targetLen int, prio
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: e.buildUserPrompt(window, prior, notes)},
 	}
-	reply, err := e.client.Complete(ctx, messages)
+	reply, err := e.requestAnalysis(ctx, messages)
 	if err != nil {
-		return fmt.Errorf("llm request failed: %w", err)
+		return err
 	}
 	res, err := parseResult(reply)
 	if err != nil {
-		return fmt.Errorf("could not parse model response: %w (reply: %.200q)", err, reply)
+		retryMessages := append([]llm.Message(nil), messages...)
+		retryMessages = append(retryMessages, llm.Message{
+			Role:    "user",
+			Content: strictRetryPrompt(reply),
+		})
+		retryReply, retryErr := e.requestAnalysis(ctx, retryMessages)
+		if retryErr == nil {
+			if retryRes, parseRetryErr := parseResult(retryReply); parseRetryErr == nil {
+				reply = retryReply
+				res = retryRes
+			} else {
+				return &analysisRunError{
+					kind:     "parse",
+					err:      fmt.Errorf("could not parse model response after retry: %w (first reply: %.200q) (retry reply: %.200q)", parseRetryErr, reply, retryReply),
+					messages: retryMessages,
+					reply:    retryReply,
+				}
+			}
+		} else {
+			return retryErr
+		}
 	}
 
 	e.mu.Lock()
@@ -416,20 +531,67 @@ func (e *Engine) analyze(ctx context.Context, window string, targetLen int, prio
 	return nil
 }
 
-func (e *Engine) recordAnalysisFailure(targetLen int) bool {
+func (e *Engine) requestAnalysis(ctx context.Context, messages []llm.Message) (string, error) {
+	start := time.Now()
+	reply, err := e.client.CompleteJSON(ctx, messages)
+	elapsed := time.Since(start)
+	if err != nil {
+		return "", &analysisRunError{
+			kind:     "llm_request",
+			err:      fmt.Errorf("llm request failed: %w", err),
+			messages: messages,
+			elapsed:  elapsed,
+		}
+	}
+	return reply, nil
+}
+
+func strictRetryPrompt(reply string) string {
+	return "Your previous response was invalid for this task. Return only one minified JSON object using the required schema. Do not include reasoning, prose, markdown, or any keys outside the schema. Previous invalid response:\n" + reply
+}
+
+type analysisRunError struct {
+	kind     string
+	err      error
+	messages []llm.Message
+	reply    string
+	elapsed  time.Duration
+}
+
+func (e *analysisRunError) Error() string { return e.err.Error() }
+func (e *analysisRunError) Unwrap() error { return e.err }
+
+func asAnalysisRunError(err error, target **analysisRunError) bool {
+	for err != nil {
+		if v, ok := err.(*analysisRunError); ok {
+			*target = v
+			return true
+		}
+		type unwrapper interface{ Unwrap() error }
+		u, ok := err.(unwrapper)
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
+
+func (e *Engine) recordAnalysisFailure(targetLen int) (int, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.failures++
+	attempt := e.failures
 	if e.failures < maxConsecutiveAnalysisFailures {
-		return false
+		return attempt, false
 	}
 	if targetLen > e.analyzedLen {
 		e.analyzedLen = targetLen
 		e.failures = 0
-		return true
+		return attempt, true
 	}
 	e.failures = 0
-	return false
+	return attempt, false
 }
 
 // dropTopicNotesLocked removes all topic-scoped live notes, keeping meeting-scoped

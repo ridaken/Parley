@@ -22,6 +22,16 @@ func TestSessionSettersAndGetProfile(t *testing.T) {
 	if b.Session.Title != "Renamed" || b.Session.AudioDir != "/tmp/audio/x" {
 		t.Fatalf("setters not persisted: %+v", b.Session)
 	}
+	if b.Session.Status != "recording" {
+		t.Fatalf("new session status = %q, want recording", b.Session.Status)
+	}
+	if err := s.SetSessionStatus(id, "finalizing"); err != nil {
+		t.Fatalf("SetSessionStatus: %v", err)
+	}
+	b, _ = s.GetSessionBundle(id)
+	if b.Session.Status != "finalizing" {
+		t.Fatalf("session status not persisted: %+v", b.Session)
+	}
 
 	p, err := s.SaveProfile(Profile{Name: "Team", Summary: "weekly sync"})
 	if err != nil {
@@ -79,6 +89,9 @@ func TestSessionRoundTrip(t *testing.T) {
 	}
 	if bundle.Session.EndedAt == "" {
 		t.Fatalf("ended_at not stamped")
+	}
+	if bundle.Session.Status != "complete" {
+		t.Fatalf("session status after EndSession = %q", bundle.Session.Status)
 	}
 
 	list, err := s.ListSessions()
