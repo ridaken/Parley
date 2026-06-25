@@ -38,6 +38,14 @@ export function DeleteSession(id: number): $CancellablePromise<void> {
 }
 
 /**
+ * ExportMarkdown saves the active or selected meeting's notes as a Markdown file.
+ * Pass sessionID=0 to export the currently running session.
+ */
+export function ExportMarkdown(sessionID: number): $CancellablePromise<string> {
+    return $Call.ByID(3378443135, sessionID);
+}
+
+/**
  * IsRunning reports whether a session is active.
  */
 export function IsRunning(): $CancellablePromise<boolean> {

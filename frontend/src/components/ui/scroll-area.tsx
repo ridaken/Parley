@@ -5,11 +5,13 @@ import { cn } from "@/lib/utils";
 function ScrollArea({
   className,
   children,
+  type = "auto",
   ...props
 }: React.ComponentProps<typeof ScrollAreaPrimitive.Root>) {
   return (
     <ScrollAreaPrimitive.Root
       className={cn("relative overflow-hidden", className)}
+      type={type}
       {...props}
     >
       <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
@@ -32,14 +34,14 @@ function ScrollBar({
       className={cn(
         "flex touch-none select-none transition-colors",
         orientation === "vertical" &&
-          "h-full w-2 border-l border-l-transparent p-px",
+          "h-full w-2.5 border-l border-l-transparent p-px",
         orientation === "horizontal" &&
-          "h-2 flex-col border-t border-t-transparent p-px",
+          "h-2.5 flex-col border-t border-t-transparent p-px",
         className
       )}
       {...props}
     >
-      <ScrollAreaPrimitive.ScrollAreaThumb className="relative flex-1 rounded-full bg-muted-foreground/35 transition-colors hover:bg-primary/55" />
+      <ScrollAreaPrimitive.ScrollAreaThumb className="relative flex-1 rounded-full bg-muted-foreground/60 transition-colors hover:bg-primary/65" />
     </ScrollAreaPrimitive.ScrollAreaScrollbar>
   );
 }

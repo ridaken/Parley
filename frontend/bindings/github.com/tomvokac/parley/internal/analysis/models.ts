@@ -27,6 +27,7 @@ export interface Assertion {
  * State is the full analysis snapshot pushed to the UI.
  */
 export interface State {
+    "summary": string;
     "current": Topic;
     "past": Topic[] | null;
     "suggestions": Suggestion[] | null;

@@ -97,6 +97,7 @@ export interface Settings {
     "llmBaseURL": string;
     "llmModel": string;
     "analysisIntervalSec": number;
+    "analysisTimeoutSec": number;
     "activeProfileID": number;
     "hasAPIKey": boolean;
     "captureSources": CaptureSource[] | null;

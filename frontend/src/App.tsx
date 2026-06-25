@@ -3,6 +3,7 @@ import { Events } from "@wailsio/runtime";
 import {
   AlertTriangle,
   AudioLines,
+  Download,
   History,
   Loader2,
   MessageSquareText,
@@ -55,6 +56,7 @@ const STATE_LABEL: Record<string, string> = {
 };
 
 const EMPTY_ANALYSIS: AnalysisState = {
+  summary: "",
   current: { title: "", summary: "", assertions: [] },
   past: [],
   suggestions: [],
@@ -133,6 +135,9 @@ function App() {
   const [analysis, setAnalysis] = useState<AnalysisState>(EMPTY_ANALYSIS);
   const [notes, setNotes] = useState<LiveNote[]>([]);
   const [busy, setBusy] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [uiError, setUiError] = useState("");
+  const [hasRecentSession, setHasRecentSession] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const [audioOpen, setAudioOpen] = useState(false);
@@ -217,17 +222,31 @@ function App() {
   useEffect(() => {
     MeetingService.IsRunning()
       .then((r) => {
-        if (r) setStatus((s) => ({ ...s, state: "listening" }));
+        if (r) {
+          setStatus((s) => ({ ...s, state: "listening" }));
+          setHasRecentSession(true);
+        }
       })
       .catch(() => {});
 
     const offStatus = Events.On("status", (e: { data: StatusEvent }) => {
       setStatus(e.data);
       setBusy(false);
+      if (e.data?.state !== "error") setUiError("");
     });
     const offTranscript = Events.On("transcript", (e: { data: Segment }) => {
       setSegments((prev) => [...prev, e.data].sort((a, b) => a.startMs - b.startMs));
     });
+    const offAnalysisStatus = Events.On(
+      "analysisStatus",
+      (e: { data: { state: string; message: string } }) => {
+        if (e.data?.state === "warning") {
+          setUiError(e.data.message);
+          return;
+        }
+        setUiError("");
+      }
+    );
     const offAnalysis = Events.On("analysis", (e: { data: AnalysisState }) => {
       const raw = e.data ?? EMPTY_ANALYSIS;
       const title = raw.current?.title ?? "";
@@ -239,6 +258,7 @@ function App() {
         const topicChanged = title !== (prev.current?.title ?? "");
         return {
           ...raw,
+          summary: raw.summary ?? "",
           current: {
             ...raw.current,
             assertions: accumulateByText(
@@ -263,6 +283,7 @@ function App() {
     return () => {
       offStatus();
       offTranscript();
+      offAnalysisStatus();
       offAnalysis();
     };
   }, []);
@@ -272,25 +293,44 @@ function App() {
   }, [segments]);
 
   const running = status.state === "listening" || status.state === "starting";
+  const bannerError = status.state === "error" ? status.message : uiError;
 
   const toggle = async () => {
     setBusy(true);
+    setUiError("");
     try {
       if (running) {
         await MeetingService.Stop();
+        setHasRecentSession(true);
       } else if (loaded) {
         // A saved meeting is open — continue it.
         await MeetingService.Resume(loaded.id);
+        setHasRecentSession(true);
       } else {
         setSegments([]);
         setAnalysis(EMPTY_ANALYSIS);
         setNotes([]);
         resetSuggestionState();
         await MeetingService.Start();
+        setHasRecentSession(true);
       }
     } catch (err) {
       console.error(err);
       setBusy(false);
+    }
+  };
+
+  const exportMarkdown = async () => {
+    if (!running && !loaded && !hasRecentSession) return;
+    setExportBusy(true);
+    setUiError("");
+    try {
+      await MeetingService.ExportMarkdown(loaded?.id ?? 0);
+    } catch (err) {
+      console.error(err);
+      setUiError(err instanceof Error ? err.message : "Couldn't export meeting notes.");
+    } finally {
+      setExportBusy(false);
     }
   };
 
@@ -342,6 +382,7 @@ function App() {
     setNotes(s.liveNotes ?? []);
     resetSuggestionState();
     setLoaded({ id: s.session.id, title: s.session.title });
+    setHasRecentSession(true);
   };
 
   const resumeSession = async (id: number) => {
@@ -350,6 +391,7 @@ function App() {
       const s = await MeetingService.LoadSession(id);
       viewSession(s);
       await MeetingService.Resume(id);
+      setHasRecentSession(true);
     } catch (err) {
       console.error(err);
       setBusy(false);
@@ -361,10 +403,16 @@ function App() {
     setSegments([]);
     setAnalysis(EMPTY_ANALYSIS);
     setNotes([]);
+    setHasRecentSession(false);
     resetSuggestionState();
   };
 
   const startLabel = loaded ? "Resume meeting" : "Start listening";
+  const canExport = running || loaded != null || hasRecentSession;
+  const exportDisabled = exportBusy || !canExport;
+  const exportTitle = canExport
+    ? "Export meeting notes as Markdown"
+    : "Start or open a meeting to export Markdown";
 
   return (
     <div className="flex h-screen flex-col">
@@ -442,6 +490,23 @@ function App() {
             <SettingsIcon className="h-4 w-4" />
           </Button>
 
+          <span className="inline-flex" title={exportTitle}>
+            <Button
+              variant="ghost"
+              size="icon"
+              title={exportTitle}
+              aria-label={exportTitle}
+              disabled={exportDisabled}
+              onClick={exportMarkdown}
+            >
+              {exportBusy ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+            </Button>
+          </span>
+
           <Button
             onClick={toggle}
             disabled={busy}
@@ -464,15 +529,17 @@ function App() {
         </div>
       </header>
 
-      {status.state === "error" && status.message && (
+      {bannerError && (
         <div className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-5 py-2 text-sm text-destructive">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span className="min-w-0 break-words">
-            {status.message}{" "}
-            <span className="text-destructive/70">
-              Details were written to the log file (parley.log in your app data
-              folder).
-            </span>
+            {bannerError}{" "}
+            {status.state === "error" && (
+              <span className="text-destructive/70">
+                Details were written to the log file (parley.log in your app data
+                folder).
+              </span>
+            )}
           </span>
         </div>
       )}
