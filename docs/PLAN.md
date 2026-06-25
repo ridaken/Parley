@@ -90,6 +90,17 @@ From a review of the LLM round-trip (payloads/prompt/presentation):
 - ✅ Analysis layout reflowed: Current topic is a full-width banner over a 2×2 of
   Suggested questions / Action items / Assertions / Past topics.
 
+## Phase 2.11 — Accumulating suggestions & assertions ✅ *(new)*
+Suggestions were replaced wholesale each pass, so un-pinned ones vanished. Now both
+suggestions and assertions **accumulate in the view, newest on top**, instead of being
+replaced (frontend-only; `accumulateByText` in `App.tsx`, deduped by `normKey`):
+- Order = pinned first (priority), then items new this pass, then previously shown ones
+  (items the model merely repeats keep their place — no reorder jitter). Capped at 50.
+- Suggestions honor pins/dismissals; assertions accumulate **within the current topic** and
+  reset on a topic change (their per-topic archive into Past is unchanged, backend-side).
+- New items **slide in from the top** (`NEW_HIGHLIGHT` → `animate-in slide-in-from-top-2`),
+  so an arrival reads as landing on top and pushing the rest down.
+
 ## Test coverage
 Full suite passes with cgo enabled (`go test ./internal/... .`) and clean under `-race`:
 - `store`: settings, profile CRUD, **session save/load/delete round-trip**. Headless

@@ -158,8 +158,10 @@ function useNewKeys(keys: string[], enabled: boolean): Set<string> {
   return fresh;
 }
 
+// Newly arrived items slide in from the top (pushing the rest down) and briefly
+// ring, so an incoming suggestion/assertion reads as landing on top of the stack.
 const NEW_HIGHLIGHT =
-  "animate-in fade-in duration-500 ring-1 ring-primary/50 bg-primary/5";
+  "animate-in fade-in slide-in-from-top-2 duration-300 ring-1 ring-primary/40";
 
 export function AnalysisPanels({
   state,

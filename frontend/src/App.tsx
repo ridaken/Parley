@@ -61,30 +61,38 @@ const EMPTY_ANALYSIS: AnalysisState = {
   actionItems: [],
 };
 
-// mergeSuggestions reconciles a fresh analysis pass with the user's pins/dismissals.
-// The model replaces the whole suggestions array each pass, so without this a pinned
-// suggestion would vanish and a dismissed one would reappear. Pinned items lead (in
-// pin order), dismissed items are dropped, then the model's fresh items follow —
-// de-duplicated by normalized text so a re-emitted pin isn't shown twice.
-function mergeSuggestions(
-  incoming: Suggestion[],
-  pinned: Map<string, Suggestion>,
-  dismissed: Set<string>
-): Suggestion[] {
+// How many suggestions / assertions to keep on screen before the oldest drop off
+// the bottom (pinned items lead the list, so they're never trimmed in practice).
+const SUGGESTION_CAP = 50;
+const ASSERTION_CAP = 50;
+
+type TextItem = { text: string };
+
+// accumulateByText folds a fresh analysis pass into the running list instead of
+// replacing it, so an item the model stops repeating doesn't disappear. Order:
+// pinned first (priority), then items that are NEW this pass (newest on top), then
+// the previously shown items in their existing order — all de-duplicated by
+// normalized text and minus dismissed. Items the model merely repeats keep their
+// place (only genuinely new ones jump to the top), which avoids reorder jitter.
+function accumulateByText<T extends TextItem>(
+  incoming: T[],
+  previous: T[],
+  opts: { pinned?: Map<string, T>; dismissed?: Set<string>; cap?: number } = {}
+): T[] {
+  const { pinned, dismissed, cap } = opts;
   const seen = new Set<string>();
-  const out: Suggestion[] = [];
-  for (const [key, s] of pinned) {
-    if (dismissed.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-  }
-  for (const s of incoming) {
+  const out: T[] = [];
+  const push = (s: T) => {
     const key = normKey(s.text);
-    if (dismissed.has(key) || seen.has(key)) continue;
+    if (seen.has(key) || dismissed?.has(key)) return;
     seen.add(key);
     out.push(s);
-  }
-  return out;
+  };
+  if (pinned) for (const [, s] of pinned) push(s);
+  const prevKeys = new Set(previous.map((s) => normKey(s.text)));
+  for (const s of incoming) if (!prevKeys.has(normKey(s.text))) push(s);
+  for (const s of previous) push(s);
+  return cap ? out.slice(0, cap) : out;
 }
 
 function StatusPill({ status }: { status: StatusEvent }) {
@@ -222,18 +230,32 @@ function App() {
     });
     const offAnalysis = Events.On("analysis", (e: { data: AnalysisState }) => {
       const raw = e.data ?? EMPTY_ANALYSIS;
-      const next: AnalysisState = {
-        ...raw,
-        suggestions: mergeSuggestions(
-          raw.suggestions ?? [],
-          pinnedRef.current,
-          dismissedRef.current
-        ),
-        actionItems: raw.actionItems ?? [],
-      };
-      setAnalysis(next);
-      // Mirror the backend: topic-scoped notes expire when the topic changes.
       const title = raw.current?.title ?? "";
+      // Accumulate against the previously displayed lists so suggestions and
+      // assertions persist (newest on top) instead of being replaced each pass.
+      // Assertions belong to the current topic, so they reset on a topic change;
+      // suggestions are meeting-wide and honor pins/dismissals.
+      setAnalysis((prev) => {
+        const topicChanged = title !== (prev.current?.title ?? "");
+        return {
+          ...raw,
+          current: {
+            ...raw.current,
+            assertions: accumulateByText(
+              raw.current?.assertions ?? [],
+              topicChanged ? [] : prev.current?.assertions ?? [],
+              { cap: ASSERTION_CAP }
+            ),
+          },
+          suggestions: accumulateByText(
+            raw.suggestions ?? [],
+            prev.suggestions ?? [],
+            { pinned: pinnedRef.current, dismissed: dismissedRef.current, cap: SUGGESTION_CAP }
+          ),
+          actionItems: raw.actionItems ?? [],
+        };
+      });
+      // Mirror the backend: topic-scoped notes expire when the topic changes.
       setNotes((prev) =>
         prev.filter((n) => n.scope === "meeting" || n.topicTitle === title)
       );
@@ -281,7 +303,7 @@ function App() {
     }
   };
 
-  // Toggle a suggestion's pin and re-merge the visible list now (don't wait for the
+  // Toggle a suggestion's pin and re-order the visible list now (don't wait for the
   // next analysis pass) using the just-computed pin map.
   const pinSuggestion = (s: Suggestion) => {
     const key = normKey(s.text);
@@ -291,7 +313,11 @@ function App() {
     setPinned(nextPinned);
     setAnalysis((a) => ({
       ...a,
-      suggestions: mergeSuggestions(a.suggestions ?? [], nextPinned, dismissedRef.current),
+      suggestions: accumulateByText([], a.suggestions ?? [], {
+        pinned: nextPinned,
+        dismissed: dismissedRef.current,
+        cap: SUGGESTION_CAP,
+      }),
     }));
   };
 
