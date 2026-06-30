@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -60,6 +62,69 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// RequestDiagnostics captures the transport details that are useful when an
+// OpenAI-compatible endpoint fails before producing a usable completion.
+type RequestDiagnostics struct {
+	Method         string `json:"method,omitempty"`
+	URL            string `json:"url,omitempty"`
+	Model          string `json:"model,omitempty"`
+	JSONMode       bool   `json:"jsonMode"`
+	ResponseFormat string `json:"responseFormat,omitempty"`
+	StatusCode     int    `json:"statusCode,omitempty"`
+	Status         string `json:"status,omitempty"`
+	ResponseBody   string `json:"responseBody,omitempty"`
+	ErrorType      string `json:"errorType,omitempty"`
+	Error          string `json:"error,omitempty"`
+	ElapsedMs      int64  `json:"elapsedMs,omitempty"`
+}
+
+// RequestError keeps HTTP status, body, and transport exception details intact
+// so callers can write useful diagnostics instead of a flattened error string.
+type RequestError struct {
+	diagnostics RequestDiagnostics
+	cause       error
+}
+
+func (e *RequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.diagnostics.StatusCode != 0 && e.diagnostics.StatusCode != http.StatusOK {
+		return fmt.Sprintf("llm: status %d: %s", e.diagnostics.StatusCode, e.diagnostics.ResponseBody)
+	}
+	if e.cause != nil {
+		return "llm: " + e.cause.Error()
+	}
+	return e.diagnostics.Error
+}
+
+func (e *RequestError) Unwrap() error { return e.cause }
+
+func (e *RequestError) Diagnostics() RequestDiagnostics {
+	if e == nil {
+		return RequestDiagnostics{}
+	}
+	return e.diagnostics
+}
+
+// JSONFallbackError reports that the JSON-mode attempt failed, then the
+// compatibility retry without response_format failed too.
+type JSONFallbackError struct {
+	JSONModeErr  error
+	FallbackErr  error
+	Diagnostics  []RequestDiagnostics
+	FallbackUsed bool
+}
+
+func (e *JSONFallbackError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("llm json-mode request failed (%v); fallback without response_format failed (%v)", e.JSONModeErr, e.FallbackErr)
+}
+
+func (e *JSONFallbackError) Unwrap() error { return e.FallbackErr }
+
 type chatResponse struct {
 	Choices []chatChoice `json:"choices"`
 	Usage   Usage        `json:"usage"`
@@ -91,13 +156,24 @@ func (c *Client) Complete(ctx context.Context, messages []Message) (string, erro
 // retry once without it so live analysis still works with those providers.
 func (c *Client) CompleteJSON(ctx context.Context, messages []Message) (string, error) {
 	reply, err := c.complete(ctx, messages, true)
-	if err != nil && responseFormatUnsupported(err) {
-		return c.complete(ctx, messages, false)
+	if err != nil && shouldRetryWithoutResponseFormat(err) {
+		fallbackReply, fallbackErr := c.complete(ctx, messages, false)
+		if fallbackErr != nil {
+			return "", &JSONFallbackError{
+				JSONModeErr:  err,
+				FallbackErr:  fallbackErr,
+				Diagnostics:  Diagnostics(err, fallbackErr),
+				FallbackUsed: true,
+			}
+		}
+		return fallbackReply, nil
 	}
 	return reply, err
 }
 
 func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool) (string, error) {
+	start := time.Now()
+	url := c.baseURL + "/chat/completions"
 	reqBody := chatRequest{
 		Model:       c.model,
 		Messages:    messages,
@@ -113,7 +189,7 @@ func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
@@ -124,27 +200,27 @@ func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", c.requestError(req, jsonMode, start, 0, "", "", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, "", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("llm: status %d: %s", resp.StatusCode, string(data))
+		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), nil)
 	}
 
 	var out chatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		return "", fmt.Errorf("llm: decode response: %w", err)
+		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("decode response: %w", err))
 	}
 	if out.Error != nil {
-		return "", fmt.Errorf("llm: %s", out.Error.Message)
+		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), errors.New(out.Error.Message))
 	}
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("llm: empty response")
+		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("empty response"))
 	}
 	if out.Usage.PromptTokens != 0 || out.Usage.CompletionTokens != 0 || out.Usage.TotalTokens != 0 {
 		log.Printf("[llm] tokens prompt=%d completion=%d total=%d",
@@ -153,11 +229,33 @@ func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool
 	reply := out.Choices[0].replyText()
 	if strings.TrimSpace(reply) == "" {
 		if out.Choices[0].FinishReason != "" {
-			return "", fmt.Errorf("llm: empty assistant content (finish_reason=%s)", out.Choices[0].FinishReason)
+			return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("empty assistant content (finish_reason=%s)", out.Choices[0].FinishReason))
 		}
-		return "", fmt.Errorf("llm: empty assistant content")
+		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("empty assistant content"))
 	}
 	return reply, nil
+}
+
+func (c *Client) requestError(req *http.Request, jsonMode bool, start time.Time, statusCode int, status, body string, cause error) error {
+	diag := RequestDiagnostics{
+		Method:         req.Method,
+		URL:            req.URL.String(),
+		Model:          c.model,
+		JSONMode:       jsonMode,
+		StatusCode:     statusCode,
+		Status:         status,
+		ResponseBody:   truncateForLog(strings.TrimSpace(body), 4000),
+		ElapsedMs:      time.Since(start).Milliseconds(),
+		ResponseFormat: "",
+	}
+	if jsonMode {
+		diag.ResponseFormat = "json_object"
+	}
+	if cause != nil {
+		diag.ErrorType = errorType(cause)
+		diag.Error = cause.Error()
+	}
+	return &RequestError{diagnostics: diag, cause: cause}
 }
 
 // Ping does a tiny request to verify the endpoint/model/key are usable.
@@ -214,4 +312,71 @@ func responseFormatUnsupported(err error) bool {
 	return strings.Contains(msg, "response_format") ||
 		strings.Contains(msg, "json_object") ||
 		strings.Contains(msg, "unsupported")
+}
+
+func shouldRetryWithoutResponseFormat(err error) bool {
+	return responseFormatUnsupported(err) || isLikelyResponseFormatTransportDrop(err)
+}
+
+func isLikelyResponseFormatTransportDrop(err error) bool {
+	var reqErr *RequestError
+	if !errors.As(err, &reqErr) {
+		return false
+	}
+	diag := reqErr.Diagnostics()
+	if !diag.JSONMode || diag.Error == "" {
+		return false
+	}
+	if diag.StatusCode != 0 && diag.StatusCode != http.StatusOK {
+		return false
+	}
+	msg := strings.ToLower(diag.Error)
+	return strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "server closed idle connection") ||
+		strings.Contains(msg, "unexpected eof")
+}
+
+// Diagnostics extracts every LLM request attempt embedded in err. The optional
+// additional errors are included in order, which is useful for JSON fallback.
+func Diagnostics(err error, additional ...error) []RequestDiagnostics {
+	var out []RequestDiagnostics
+	collectDiagnostics(err, &out)
+	for _, e := range additional {
+		collectDiagnostics(e, &out)
+	}
+	return out
+}
+
+func collectDiagnostics(err error, out *[]RequestDiagnostics) {
+	if err == nil {
+		return
+	}
+	var fallback *JSONFallbackError
+	if errors.As(err, &fallback) && len(fallback.Diagnostics) > 0 {
+		*out = append(*out, fallback.Diagnostics...)
+		return
+	}
+	var reqErr *RequestError
+	if errors.As(err, &reqErr) {
+		*out = append(*out, reqErr.Diagnostics())
+	}
+}
+
+func errorType(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return fmt.Sprintf("%T", urlErr.Err)
+	}
+	return fmt.Sprintf("%T", err)
+}
+
+func truncateForLog(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "...[truncated]"
 }

@@ -1,4 +1,5 @@
 .task
+.gocache/
 bin
 frontend/dist
 frontend/node_modules
