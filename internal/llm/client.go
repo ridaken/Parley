@@ -324,7 +324,10 @@ func isLikelyResponseFormatTransportDrop(err error) bool {
 		return false
 	}
 	diag := reqErr.Diagnostics()
-	if !diag.JSONMode || diag.StatusCode != 0 {
+	if !diag.JSONMode || diag.Error == "" {
+		return false
+	}
+	if diag.StatusCode != 0 && diag.StatusCode != http.StatusOK {
 		return false
 	}
 	msg := strings.ToLower(diag.Error)
