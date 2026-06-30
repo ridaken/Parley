@@ -18,23 +18,26 @@ const (
 
 // AnalysisFailure is a structured record for a failed live-analysis pass.
 type AnalysisFailure struct {
-	Type           string    `json:"type"`
-	Timestamp      time.Time `json:"timestamp"`
-	SessionID      int64     `json:"sessionID,omitempty"`
-	SessionTitle   string    `json:"sessionTitle,omitempty"`
-	ConnectionName string    `json:"connectionName,omitempty"`
-	BaseURL        string    `json:"baseURL,omitempty"`
-	Model          string    `json:"model,omitempty"`
-	Kind           string    `json:"kind"`
-	Error          string    `json:"error"`
-	Attempt        int       `json:"attempt"`
-	MaxAttempts    int       `json:"maxAttempts"`
-	SkippedWindow  bool      `json:"skippedWindow"`
-	TargetLen      int       `json:"targetLen"`
-	ElapsedMs      int64     `json:"elapsedMs,omitempty"`
-	Request        any       `json:"request,omitempty"`
-	Response       string    `json:"response,omitempty"`
-	ErrorDetails   any       `json:"errorDetails,omitempty"`
+	Type             string    `json:"type"`
+	Timestamp        time.Time `json:"timestamp"`
+	SessionID        int64     `json:"sessionID,omitempty"`
+	SessionTitle     string    `json:"sessionTitle,omitempty"`
+	ConnectionName   string    `json:"connectionName,omitempty"`
+	BaseURL          string    `json:"baseURL,omitempty"`
+	Model            string    `json:"model,omitempty"`
+	Kind             string    `json:"kind"`
+	Error            string    `json:"error"`
+	Attempt          int       `json:"attempt"`
+	MaxAttempts      int       `json:"maxAttempts"`
+	SkippedWindow    bool      `json:"skippedWindow"`
+	TargetLen        int       `json:"targetLen"`
+	PendingLineCount int       `json:"pendingLineCount,omitempty"`
+	TimeoutMs        int64     `json:"timeoutMs,omitempty"`
+	ElapsedMs        int64     `json:"elapsedMs,omitempty"`
+	TotalElapsedMs   int64     `json:"totalElapsedMs,omitempty"`
+	Request          any       `json:"request,omitempty"`
+	Response         string    `json:"response,omitempty"`
+	ErrorDetails     any       `json:"errorDetails,omitempty"`
 }
 
 // FrontendError is a browser/WebView exception forwarded from the React app.

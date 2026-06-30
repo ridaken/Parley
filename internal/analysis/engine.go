@@ -78,7 +78,6 @@ type LiveNote struct {
 
 const (
 	maxTranscriptLines = 600
-	promptWindowLines  = 60
 	maxPastTopics      = 30
 	maxActionItems     = 100
 )
@@ -113,8 +112,6 @@ type Engine struct {
 }
 
 const defaultAnalysisTimeout = 30 * time.Second
-const maxConsecutiveAnalysisFailures = 3
-const maxRetryResponseChars = 1200
 
 var blankAudioTokenRE = regexp.MustCompile(`(?i)\[blank_audio\]`)
 
@@ -132,22 +129,25 @@ type DiagnosticMeta struct {
 // analysis pass fails. Request/response are populated for trace-level logging;
 // the concrete logger decides how much to persist.
 type AnalysisFailure struct {
-	Timestamp      time.Time
-	SessionID      int64
-	SessionTitle   string
-	ConnectionName string
-	BaseURL        string
-	Model          string
-	Kind           string
-	Error          string
-	Attempt        int
-	MaxAttempts    int
-	SkippedWindow  bool
-	TargetLen      int
-	Elapsed        time.Duration
-	Request        []llm.Message
-	Response       string
-	ErrorDetails   any
+	Timestamp        time.Time
+	SessionID        int64
+	SessionTitle     string
+	ConnectionName   string
+	BaseURL          string
+	Model            string
+	Kind             string
+	Error            string
+	Attempt          int
+	MaxAttempts      int
+	SkippedWindow    bool
+	TargetLen        int
+	PendingLineCount int
+	Timeout          time.Duration
+	Elapsed          time.Duration
+	TotalElapsed     time.Duration
+	Request          []llm.Message
+	Response         string
+	ErrorDetails     any
 }
 
 type FailureLogger interface {
@@ -187,8 +187,12 @@ func (e *Engine) Feed(speaker, text string) {
 	}
 	e.mu.Lock()
 	e.transcript = append(e.transcript, line{speaker: speaker, text: text})
-	if len(e.transcript) > maxTranscriptLines {
-		e.transcript = e.transcript[len(e.transcript)-maxTranscriptLines:]
+	if overflow := len(e.transcript) - maxTranscriptLines; overflow > 0 {
+		e.transcript = e.transcript[overflow:]
+		e.analyzedLen -= overflow
+		if e.analyzedLen < 0 {
+			e.analyzedLen = 0
+		}
 	}
 	e.mu.Unlock()
 }
@@ -232,7 +236,7 @@ func (e *Engine) Restore(state State, notes []LiveNote, transcript []struct{ Spe
 	}
 	e.analyzedLen = len(e.transcript)
 	e.failures = 0
-	e.lastRequestFingerprint = normalizedTranscriptFingerprint(e.recentWindowLocked())
+	e.lastRequestFingerprint = ""
 }
 
 // Start begins the analysis loop.
@@ -293,8 +297,9 @@ func (e *Engine) maybeAnalyze(ctx context.Context) {
 		defer e.busy.Store(false)
 		reqCtx, cancel := context.WithTimeout(ctx, e.timeout)
 		defer cancel()
+		start := time.Now()
 		if err := e.analyze(reqCtx, job.window, job.targetLen, job.prior, job.notes); err != nil {
-			e.handleAnalysisError(err, job.targetLen)
+			e.handleAnalysisError(err, job, time.Since(start))
 		}
 	}()
 }
@@ -312,45 +317,46 @@ func (e *Engine) analyzeOnce(ctx context.Context) {
 
 	reqCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
+	start := time.Now()
 	if err := e.analyze(reqCtx, job.window, job.targetLen, job.prior, job.notes); err != nil {
-		e.handleAnalysisError(err, job.targetLen)
+		e.handleAnalysisError(err, job, time.Since(start))
 	}
 }
 
-func (e *Engine) handleAnalysisError(err error, targetLen int) {
-	msg := fmt.Sprintf("Live analysis did not complete: %v", err)
-	attempt, skipped := e.recordAnalysisFailure(targetLen)
-	if skipped {
-		msg = fmt.Sprintf("%s. Skipped that transcript window after %d consecutive failures so live analysis can continue with newer transcript.", msg, maxConsecutiveAnalysisFailures)
-	}
-	e.logAnalysisFailure(err, targetLen, attempt, skipped)
+func (e *Engine) handleAnalysisError(err error, job analysisJob, totalElapsed time.Duration) {
+	msg := fmt.Sprintf("Live analysis did not complete: %v. Pending transcript will be analyzed with the next fresh request after new transcript arrives.", err)
+	attempt := e.recordAnalysisFailure()
+	e.logAnalysisFailure(err, job, attempt, totalElapsed)
 	log.Printf("[analysis] %s", msg)
 	if e.statusUpdate != nil {
 		e.statusUpdate(msg)
 	}
 }
 
-func (e *Engine) logAnalysisFailure(err error, targetLen, attempt int, skipped bool) {
+func (e *Engine) logAnalysisFailure(err error, job analysisJob, attempt int, totalElapsed time.Duration) {
 	e.mu.Lock()
 	meta := e.meta
 	logger := e.logger
+	timeout := e.timeout
 	e.mu.Unlock()
 	if logger == nil {
 		return
 	}
 	event := AnalysisFailure{
-		Timestamp:      time.Now().UTC(),
-		SessionID:      meta.SessionID,
-		SessionTitle:   meta.SessionTitle,
-		ConnectionName: meta.ConnectionName,
-		BaseURL:        meta.BaseURL,
-		Model:          meta.Model,
-		Kind:           "analysis",
-		Error:          err.Error(),
-		Attempt:        attempt,
-		MaxAttempts:    maxConsecutiveAnalysisFailures,
-		SkippedWindow:  skipped,
-		TargetLen:      targetLen,
+		Timestamp:        time.Now().UTC(),
+		SessionID:        meta.SessionID,
+		SessionTitle:     meta.SessionTitle,
+		ConnectionName:   meta.ConnectionName,
+		BaseURL:          meta.BaseURL,
+		Model:            meta.Model,
+		Kind:             "analysis",
+		Error:            err.Error(),
+		Attempt:          attempt,
+		SkippedWindow:    false,
+		TargetLen:        job.targetLen,
+		PendingLineCount: job.pendingLineCount,
+		Timeout:          timeout,
+		TotalElapsed:     totalElapsed,
 	}
 	var runErr *analysisRunError
 	if asAnalysisRunError(err, &runErr) {
@@ -364,28 +370,32 @@ func (e *Engine) logAnalysisFailure(err error, targetLen, attempt int, skipped b
 }
 
 type analysisJob struct {
-	window    string
-	targetLen int
-	prior     priorView
-	notes     []LiveNote
+	window           string
+	targetLen        int
+	pendingLineCount int
+	prior            priorView
+	notes            []LiveNote
 }
 
 func (e *Engine) snapshotAnalysisJob() (analysisJob, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.analyzedLen > len(e.transcript) {
+		e.analyzedLen = len(e.transcript)
+	}
 	if len(e.transcript) == e.analyzedLen {
 		return analysisJob{}, false
 	}
-	window := e.recentWindowLocked()
+	window := e.pendingWindowLocked()
 	fingerprint := normalizedTranscriptFingerprint(window)
 	if fingerprint == "" || fingerprint == e.lastRequestFingerprint {
-		e.analyzedLen = len(e.transcript)
 		return analysisJob{}, false
 	}
 	e.lastRequestFingerprint = fingerprint
 	return analysisJob{
-		window:    window,
-		targetLen: len(e.transcript),
+		window:           window,
+		targetLen:        len(e.transcript),
+		pendingLineCount: len(e.transcript) - e.analyzedLen,
 		prior: priorView{
 			meetingSummary: e.state.Summary,
 			title:          e.state.Current.Title,
@@ -411,13 +421,20 @@ func (e *Engine) liveNotesForPromptLocked() []LiveNote {
 	return out
 }
 
-func (e *Engine) recentWindowLocked() string {
-	start := 0
-	if len(e.transcript) > promptWindowLines {
-		start = len(e.transcript) - promptWindowLines
+func (e *Engine) pendingWindowLocked() string {
+	start := e.analyzedLen
+	if start < 0 {
+		start = 0
 	}
+	if start > len(e.transcript) {
+		start = len(e.transcript)
+	}
+	return formatTranscriptLines(e.transcript[start:])
+}
+
+func formatTranscriptLines(lines []line) string {
 	var b strings.Builder
-	for _, l := range e.transcript[start:] {
+	for _, l := range lines {
 		fmt.Fprintf(&b, "%s: %s\n", l.speaker, l.text)
 	}
 	return b.String()
@@ -448,7 +465,7 @@ type llmResult struct {
 }
 
 // priorView is the engine's last analysis, fed back into the prompt so the model
-// refines and extends it instead of re-deriving everything from the recent window.
+// refines and extends it instead of re-deriving everything from the pending lines.
 type priorView struct {
 	meetingSummary string
 	title          string
@@ -458,6 +475,7 @@ type priorView struct {
 }
 
 func (e *Engine) analyze(ctx context.Context, window string, targetLen int, prior priorView, notes []LiveNote) error {
+	start := time.Now()
 	messages := []llm.Message{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: e.buildUserPrompt(window, prior, notes)},
@@ -468,26 +486,12 @@ func (e *Engine) analyze(ctx context.Context, window string, targetLen int, prio
 	}
 	res, err := parseResult(reply)
 	if err != nil {
-		retryMessages := append([]llm.Message(nil), messages...)
-		retryMessages = append(retryMessages, llm.Message{
-			Role:    "user",
-			Content: strictRetryPrompt(reply),
-		})
-		retryReply, retryErr := e.requestAnalysis(ctx, retryMessages)
-		if retryErr == nil {
-			if retryRes, parseRetryErr := parseResult(retryReply); parseRetryErr == nil {
-				reply = retryReply
-				res = retryRes
-			} else {
-				return &analysisRunError{
-					kind:     "parse",
-					err:      fmt.Errorf("could not parse model response after retry: %w (first reply: %.200q) (retry reply: %.200q)", parseRetryErr, reply, retryReply),
-					messages: retryMessages,
-					reply:    retryReply,
-				}
-			}
-		} else {
-			return retryErr
+		return &analysisRunError{
+			kind:     "parse",
+			err:      fmt.Errorf("could not parse model response: %w (reply: %.200q)", err, reply),
+			messages: messages,
+			reply:    reply,
+			elapsed:  time.Since(start),
 		}
 	}
 
@@ -537,6 +541,7 @@ func (e *Engine) analyze(ctx context.Context, window string, targetLen int, prio
 		e.analyzedLen = targetLen
 	}
 	e.failures = 0
+	e.lastRequestFingerprint = ""
 	snapshot := e.cloneStateLocked()
 	e.mu.Unlock()
 
@@ -561,25 +566,6 @@ func (e *Engine) requestAnalysis(ctx context.Context, messages []llm.Message) (s
 		}
 	}
 	return reply, nil
-}
-
-func strictRetryPrompt(reply string) string {
-	reply = truncateForPrompt(reply, maxRetryResponseChars)
-	return "/no_think\nYour previous response was invalid for this task. Return only one minified JSON object using the required schema. The first character must be { and the last character must be }. Do not include reasoning, prose, markdown, or any keys outside the schema. Previous invalid response:\n" + reply
-}
-
-func truncateForPrompt(s string, max int) string {
-	s = strings.TrimSpace(s)
-	if max <= 0 {
-		return s
-	}
-	for i := range s {
-		if max == 0 {
-			return s[:i] + "...[truncated]"
-		}
-		max--
-	}
-	return s
 }
 
 type analysisRunError struct {
@@ -609,21 +595,11 @@ func asAnalysisRunError(err error, target **analysisRunError) bool {
 	return false
 }
 
-func (e *Engine) recordAnalysisFailure(targetLen int) (int, bool) {
+func (e *Engine) recordAnalysisFailure() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.failures++
-	attempt := e.failures
-	if e.failures < maxConsecutiveAnalysisFailures {
-		return attempt, false
-	}
-	if targetLen > e.analyzedLen {
-		e.analyzedLen = targetLen
-		e.failures = 0
-		return attempt, true
-	}
-	e.failures = 0
-	return attempt, false
+	return e.failures
 }
 
 // dropTopicNotesLocked removes all topic-scoped live notes, keeping meeting-scoped
@@ -717,7 +693,7 @@ func (e *Engine) buildUserPrompt(window string, prior priorView, notes []LiveNot
 			"assertions":          prior.assertions,
 			"actionItems":         prior.actionItems,
 		},
-		"recentTranscript": window,
+		"unprocessedTranscript": window,
 		"speakerLabels": map[string]string{
 			"You":    "the listener",
 			"Others": "remote/other participants",
@@ -749,13 +725,13 @@ If the model/runtime supports thinking modes, use non-thinking mode: /no_think.
 Respond with ONLY a single minified JSON object (no markdown, no prose) of this shape:
 {"currentTopicTitle": string, "currentTopicSummary": string (1-2 sentences), "meetingSummary": string (concise markdown bullets), "topicChanged": boolean, "assertions": [{"speaker": string (use the speaker label exactly as it appears in the transcript), "text": string}], "suggestions": [{"kind": "question"|"clarification", "text": string}], "actionItems": [{"text": string, "owner": string}]}.
 The first character of your response must be { and the last character must be }. Do not include reasoning, chain-of-thought, commentary, markdown fences, or <think>...</think> blocks in your response.
-You are given your CURRENT UNDERSTANDING SO FAR (your prior analysis). Update and merge it rather than starting over: refine the summaries, keep still-valid assertions, add new ones from the recent transcript, and do not drop a still-valid assertion just because it isn't repeated in the recent window. Avoid restating duplicates.
+You are given your CURRENT UNDERSTANDING SO FAR (your prior analysis). Update and merge it rather than starting over: refine the summaries, keep still-valid assertions, add new ones from the UNPROCESSED TRANSCRIPT, and do not drop a still-valid assertion just because it isn't repeated in the pending lines. Avoid restating duplicates.
 - topicChanged: set true ONLY when the discussion has genuinely moved to a different subject than the PREVIOUS TOPIC TITLE. While the conversation is still about that subject — even as new points, details, or sub-points come up — set it false. A topic spans the whole discussion of a subject, not each individual statement; do not split a continuing discussion into many topics.
 - currentTopicTitle: when topicChanged is false, reuse the PREVIOUS TOPIC TITLE EXACTLY as given — do not reword, rephrase, shorten, or "improve" it. Only write a new title when topicChanged is true.
 - meetingSummary: maintain a meeting-level running summary in concise markdown bullets. Use one bullet per discussion thread, decision, or important unresolved question. Merge and refine the existing Meeting summary instead of restarting, so long single-topic meetings still develop useful subtopic-like notes.
 - assertions: the key claims/points/decisions stated about the current topic (max 6, most recent/important first).
 - suggestions: sharp questions the listener could ask right now, or things that need clarification (max 4).
-- actionItems: tasks, follow-ups, or commitments stated in the RECENT TRANSCRIPT, with owner set to the responsible person's name/label if stated (else ""). List only items visible in this window — earlier ones are already tracked for you under CURRENT UNDERSTANDING SO FAR; re-list a tracked item only to add an owner that was just stated.
+- actionItems: tasks, follow-ups, or commitments stated in the UNPROCESSED TRANSCRIPT, with owner set to the responsible person's name/label if stated (else ""). Earlier ones are already tracked for you under CURRENT UNDERSTANDING SO FAR; re-list a tracked item only to add an owner that was just stated.
 Be concise and specific. If the transcript is too sparse to tell, use empty arrays and a best-effort title.`
 
 // parseResult extracts the first parseable JSON-like object from an LLM reply.
