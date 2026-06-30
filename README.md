@@ -343,18 +343,28 @@ Audio is recorded per source under your app-data `recordings/session-<id>/` fold
 - **LLM "context deadline exceeded".** The endpoint didn't answer in time — check the
   URL/port, that the server is up, and (for local servers) that the model finished
   loading. The Settings dialog now explains common failures.
-- **App crashes when dragging the window between monitors.** This was a WebView2 bug
-  that fired when a window crosses a DPI boundary (e.g. a 100 % screen → a 150 %
-  screen): WebView2 momentarily reports `RESOURCE_NOT_IN_CORRECT_STATE`, and older
-  Wails builds treated that transient COM error as fatal (`os.Exit`). It is fixed in
-  the Wails version this repo targets (`v3.0.0-alpha2.105`, which carries the fixes for
-  upstream issues
-  [#5544](https://github.com/wailsapp/wails/issues/5544)/[#5580](https://github.com/wailsapp/wails/issues/5580)
-  and [#5605](https://github.com/wailsapp/wails/issues/5605)). If you still see the
-  crash:
+- **App crashes when dragging the window between monitors.** This was a WebView2 bug:
+  while the window is moving to another monitor the WebView2 controller is briefly in a
+  transitional state, and `Chromium.Focus()` called `controller.MoveFocus()`
+  unconditionally — which returns `ERROR_INVALID_STATE` (`0x8007139F`). Older Wails
+  builds treated that transient COM error as fatal (`os.Exit(1)`), taking the whole
+  process down. (It reproduces on same-DPI setups too, not only across a DPI boundary.)
+  Note that Parley's panic logging could never catch this — `os.Exit(1)` bypasses
+  deferred funcs and `recover()`, which is why the crash left no trace in `parley.log`.
+
+  The crash fix is upstream issue
+  [#5650](https://github.com/wailsapp/wails/issues/5650) /
+  [#5568](https://github.com/wailsapp/wails/pull/5568), shipped in `webview2 v1.0.25`
+  (first bundled in Wails `v3.0.0-alpha2.106`). A follow-on mixed-DPI bug where content
+  shrinks then disappears after a cross-DPI drag
+  ([#5677](https://github.com/wailsapp/wails/issues/5677) /
+  [#5689](https://github.com/wailsapp/wails/pull/5689)) was fixed in
+  `v3.0.0-alpha2.109`. This repo now targets **`v3.0.0-alpha2.109`** (pins
+  `webview2 v1.0.27`), which carries both fixes. If you still see the crash:
   1. **Rebuild clean** so the fixed library is actually linked:
-     `go clean -cache && rm -rf bin && wails3 build`. Confirm the resolved version with
-     `go list -m github.com/wailsapp/wails/v3` (expect `…alpha2.105`).
+     `go clean -cache && rm -rf bin && wails3 build`. Confirm the resolved versions with
+     `go list -m github.com/wailsapp/wails/v3` (expect `…alpha2.109`) and
+     `go list -m github.com/wailsapp/wails/webview2` (expect `v1.0.27`, must be ≥ v1.0.25).
   2. **Update the WebView2 Runtime** on the machine (old Evergreen runtimes mishandle
      the DPI transition).
   3. If it persists, it's likely a different un-converted WebView2 call site — grab the
