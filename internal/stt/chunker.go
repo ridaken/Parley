@@ -171,7 +171,7 @@ func (c *Chunker) flush(ctx context.Context) {
 		default:
 		}
 		if shouldSkipAudio(j.samples) {
-			continue // skip silent windows
+			continue // skip silent or low-energy windows
 		}
 		start := time.Now()
 		audioMs := j.endMs - j.startMs

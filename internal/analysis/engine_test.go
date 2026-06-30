@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tomvokac/parley/internal/llm"
 )
@@ -82,11 +83,35 @@ func TestParseResultAcceptsStateShapedObject(t *testing.T) {
 
 func TestStrictRetryPromptTruncatesPreviousResponse(t *testing.T) {
 	prompt := strictRetryPrompt(strings.Repeat("x", maxRetryResponseChars+200))
-	if len(prompt) > maxRetryResponseChars+300 {
-		t.Fatalf("retry prompt was not bounded, len=%d", len(prompt))
+	if strings.Count(prompt, "x") != maxRetryResponseChars {
+		t.Fatalf("retry prompt retained %d response chars, want %d", strings.Count(prompt, "x"), maxRetryResponseChars)
 	}
 	if !contains(prompt, "...[truncated]") {
 		t.Fatalf("retry prompt missing truncation marker: %q", prompt)
+	}
+	if !contains(prompt, "/no_think") || !contains(prompt, "first character must be {") {
+		t.Fatalf("retry prompt missing non-thinking JSON-only instruction: %q", prompt)
+	}
+}
+
+func TestTruncateForPromptPreservesUTF8(t *testing.T) {
+	got := truncateForPrompt("alpha 測試 beta", 8)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateForPrompt produced invalid UTF-8: %q", got)
+	}
+	if !contains(got, "...[truncated]") {
+		t.Fatalf("truncateForPrompt missing marker: %q", got)
+	}
+}
+
+func TestBuildUserPromptDisablesThinkingMode(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	prompt := eng.buildUserPrompt("You: hi\n", priorView{}, nil)
+	if !strings.HasPrefix(prompt, "/no_think\n") {
+		t.Fatalf("user prompt should start with no_think directive:\n%s", prompt)
+	}
+	if !contains(prompt, "Start with { and end with }") {
+		t.Fatalf("user prompt missing JSON boundary instruction:\n%s", prompt)
 	}
 }
 
