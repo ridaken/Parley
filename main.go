@@ -38,8 +38,11 @@ func main() {
 	}
 	// Any panic that unwinds to the main goroutine (e.g. inside the Wails event
 	// loop) is written to the log with a full stack before the process dies, so a
-	// reproducible crash — like the multi-monitor drag — leaves a diagnosable
-	// trail instead of vanishing silently in a windowless GUI build.
+	// reproducible crash leaves a diagnosable trail instead of vanishing silently
+	// in a windowless GUI build. Note this does NOT catch the historic
+	// multi-monitor-drag crash: that was an os.Exit(1) from inside WebView2's
+	// error callback (upstream wails #5650), which bypasses deferred funcs and
+	// recover entirely — fixed by the alpha2.109 dependency bump, not here.
 	defer logPanic()
 
 	db, err := store.Open(dbPath())
