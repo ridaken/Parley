@@ -441,6 +441,44 @@ func TestAnalysisFailureLoggerReceivesRequestResponseAndSessionContext(t *testin
 	}
 }
 
+func TestAnalysisFailureLoggerReceivesLLMTransportDetails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"model warming up"}}`))
+	}))
+	defer srv.Close()
+
+	logger := &captureFailureLogger{}
+	eng := NewEngineWithTimeout(llm.NewClient(srv.URL, "", "m"), 3*time.Second, time.Second, Context{}, nil, nil)
+	eng.SetFailureLogger(DiagnosticMeta{
+		SessionID:      43,
+		SessionTitle:   "Transport failure",
+		ConnectionName: "Local",
+		BaseURL:        srv.URL,
+		Model:          "m",
+	}, logger)
+	eng.Feed("Others", "line")
+	eng.analyzeOnce(context.Background())
+
+	if len(logger.events) != 1 {
+		t.Fatalf("logged %d events, want 1", len(logger.events))
+	}
+	ev := logger.events[0]
+	if ev.Kind != "llm_request" {
+		t.Fatalf("kind = %q, want llm_request", ev.Kind)
+	}
+	details, ok := ev.ErrorDetails.([]llm.RequestDiagnostics)
+	if !ok || len(details) != 1 {
+		t.Fatalf("missing LLM diagnostics: %#v", ev.ErrorDetails)
+	}
+	if details[0].StatusCode != http.StatusServiceUnavailable || details[0].ResponseFormat != "json_object" {
+		t.Fatalf("unexpected transport details: %+v", details[0])
+	}
+	if !contains(details[0].ResponseBody, "model warming up") {
+		t.Fatalf("response body missing from diagnostics: %+v", details[0])
+	}
+}
+
 func TestAnalyzeOnceTimesOutAndReportsStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(200 * time.Millisecond)

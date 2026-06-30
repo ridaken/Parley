@@ -34,6 +34,7 @@ type AnalysisFailure struct {
 	ElapsedMs      int64     `json:"elapsedMs,omitempty"`
 	Request        any       `json:"request,omitempty"`
 	Response       string    `json:"response,omitempty"`
+	ErrorDetails   any       `json:"errorDetails,omitempty"`
 }
 
 // FrontendError is a browser/WebView exception forwarded from the React app.

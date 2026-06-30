@@ -143,6 +143,7 @@ type AnalysisFailure struct {
 	Elapsed        time.Duration
 	Request        []llm.Message
 	Response       string
+	ErrorDetails   any
 }
 
 type FailureLogger interface {
@@ -364,6 +365,7 @@ func (e *Engine) logAnalysisFailure(err error, targetLen, attempt int, skipped b
 		event.Request = runErr.messages
 		event.Response = runErr.reply
 		event.Elapsed = runErr.elapsed
+		event.ErrorDetails = llm.Diagnostics(runErr.err)
 	}
 	logger.LogAnalysisFailure(event)
 }

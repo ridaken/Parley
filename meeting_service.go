@@ -64,6 +64,7 @@ func (l analysisDiagLogger) LogAnalysisFailure(f analysis.AnalysisFailure) {
 		ElapsedMs:      f.Elapsed.Milliseconds(),
 		Request:        f.Request,
 		Response:       f.Response,
+		ErrorDetails:   f.ErrorDetails,
 	})
 	if err != nil {
 		log.Printf("[diagnostics] write analysis failure: %v", err)

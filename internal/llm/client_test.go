@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,6 +118,101 @@ func TestCompleteJSONFallsBackWhenUnsupported(t *testing.T) {
 	}
 	if got != `{"ok":true}` || calls != 2 {
 		t.Fatalf("got %q after %d calls", got, calls)
+	}
+}
+
+func TestCompleteJSONFallsBackAfterJSONModeTransportDrop(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if calls == 1 {
+			if req.ResponseFormat == nil {
+				t.Fatal("first call should request response_format")
+			}
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatalf("hijack response: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		if req.ResponseFormat != nil {
+			t.Fatalf("fallback call should omit response_format: %+v", req.ResponseFormat)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": `{"ok":true}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	got, err := NewClient(srv.URL, "", "m").CompleteJSON(context.Background(), []Message{{Role: "user", Content: "json"}})
+	if err != nil {
+		t.Fatalf("CompleteJSON fallback after EOF: %v", err)
+	}
+	if got != `{"ok":true}` || calls != 2 {
+		t.Fatalf("got %q after %d calls", got, calls)
+	}
+}
+
+func TestCompleteDiagnosticsIncludeHTTPStatusAndBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, "", "m").Complete(context.Background(), []Message{{Role: "user", Content: "x"}})
+	if err == nil {
+		t.Fatal("expected HTTP error")
+	}
+	var reqErr *RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("expected RequestError, got %T %v", err, err)
+	}
+	diag := reqErr.Diagnostics()
+	if diag.StatusCode != http.StatusTooManyRequests || !strings.Contains(diag.ResponseBody, "rate limited") {
+		t.Fatalf("missing HTTP diagnostics: %+v", diag)
+	}
+	if diag.URL != srv.URL+"/chat/completions" || diag.Model != "m" {
+		t.Fatalf("missing request diagnostics: %+v", diag)
+	}
+}
+
+func TestCompleteJSONFallbackErrorCarriesBothAttempts(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`unsupported response_format`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`model crashed`))
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, "", "m").CompleteJSON(context.Background(), []Message{{Role: "user", Content: "json"}})
+	if err == nil {
+		t.Fatal("expected fallback failure")
+	}
+	var fallbackErr *JSONFallbackError
+	if !errors.As(err, &fallbackErr) {
+		t.Fatalf("expected JSONFallbackError, got %T %v", err, err)
+	}
+	diags := Diagnostics(err)
+	if len(diags) != 2 {
+		t.Fatalf("expected two attempt diagnostics, got %+v", diags)
+	}
+	if !diags[0].JSONMode || diags[0].StatusCode != http.StatusBadRequest {
+		t.Fatalf("first diagnostics should be JSON-mode 400: %+v", diags[0])
+	}
+	if diags[1].JSONMode || diags[1].StatusCode != http.StatusInternalServerError {
+		t.Fatalf("second diagnostics should be non-JSON fallback 500: %+v", diags[1])
 	}
 }
 
