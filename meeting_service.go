@@ -48,7 +48,7 @@ func (l analysisDiagLogger) LogAnalysisFailure(f analysis.AnalysisFailure) {
 	if s, err := l.store.GetSettings(); err == nil {
 		level = s.LoggingLevel
 	}
-	err := diagnostics.LogAnalysisFailure(dataDir(), level, diagnostics.AnalysisFailure{
+	event := diagnostics.AnalysisFailure{
 		Timestamp:      f.Timestamp,
 		SessionID:      f.SessionID,
 		SessionTitle:   f.SessionTitle,
@@ -65,7 +65,11 @@ func (l analysisDiagLogger) LogAnalysisFailure(f analysis.AnalysisFailure) {
 		Request:        f.Request,
 		Response:       f.Response,
 		ErrorDetails:   f.ErrorDetails,
-	})
+	}
+	if level != diagnostics.LevelTrace {
+		event.ErrorDetails = nil
+	}
+	err := diagnostics.LogAnalysisFailure(dataDir(), level, event)
 	if err != nil {
 		log.Printf("[diagnostics] write analysis failure: %v", err)
 	}
