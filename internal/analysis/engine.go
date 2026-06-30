@@ -97,14 +97,15 @@ type Engine struct {
 	emit         func(State)
 	statusUpdate func(string)
 
-	mu          sync.Mutex
-	transcript  []line
-	state       State
-	analyzedLen int
-	liveNotes   []LiveNote
-	failures    int
-	meta        DiagnosticMeta
-	logger      FailureLogger
+	mu                     sync.Mutex
+	transcript             []line
+	state                  State
+	analyzedLen            int
+	liveNotes              []LiveNote
+	failures               int
+	lastRequestFingerprint string
+	meta                   DiagnosticMeta
+	logger                 FailureLogger
 
 	busy   atomic.Bool
 	cancel context.CancelFunc
@@ -113,6 +114,9 @@ type Engine struct {
 
 const defaultAnalysisTimeout = 30 * time.Second
 const maxConsecutiveAnalysisFailures = 3
+const maxRetryResponseChars = 1200
+
+var blankAudioTokenRE = regexp.MustCompile(`(?i)\[blank_audio\]`)
 
 // DiagnosticMeta describes the meeting/provider context attached to structured
 // failure logs.
@@ -177,7 +181,7 @@ func (e *Engine) SetFailureLogger(meta DiagnosticMeta, logger FailureLogger) {
 
 // Feed adds a transcribed line.
 func (e *Engine) Feed(speaker, text string) {
-	text = strings.TrimSpace(text)
+	text = cleanTranscriptText(text)
 	if text == "" {
 		return
 	}
@@ -219,13 +223,16 @@ func (e *Engine) Restore(state State, notes []LiveNote, transcript []struct{ Spe
 	e.liveNotes = notes
 	e.transcript = e.transcript[:0]
 	for _, h := range transcript {
-		e.transcript = append(e.transcript, line{speaker: h.Speaker, text: h.Text})
+		if text := cleanTranscriptText(h.Text); text != "" {
+			e.transcript = append(e.transcript, line{speaker: h.Speaker, text: text})
+		}
 	}
 	if len(e.transcript) > maxTranscriptLines {
 		e.transcript = e.transcript[len(e.transcript)-maxTranscriptLines:]
 	}
 	e.analyzedLen = len(e.transcript)
 	e.failures = 0
+	e.lastRequestFingerprint = normalizedTranscriptFingerprint(e.recentWindowLocked())
 }
 
 // Start begins the analysis loop.
@@ -276,32 +283,18 @@ func (e *Engine) maybeAnalyze(ctx context.Context) {
 	if e.busy.Load() {
 		return // previous analysis still running
 	}
-	e.mu.Lock()
-	if len(e.transcript) == e.analyzedLen {
-		e.mu.Unlock()
-		return // no new content
+	job, ok := e.snapshotAnalysisJob()
+	if !ok {
+		return
 	}
-	window := e.recentWindowLocked()
-	targetLen := len(e.transcript)
-	// Snapshot the prior analysis under the lock (copy the slices — the goroutine
-	// reads them after we unlock) so the model can refine rather than restart.
-	prior := priorView{
-		meetingSummary: e.state.Summary,
-		title:          e.state.Current.Title,
-		summary:        e.state.Current.Summary,
-		assertions:     append([]Assertion(nil), e.state.Current.Assertions...),
-		actionItems:    append([]ActionItem(nil), e.state.ActionItems...),
-	}
-	notes := e.liveNotesForPromptLocked()
-	e.mu.Unlock()
 
 	e.busy.Store(true)
 	go func() {
 		defer e.busy.Store(false)
 		reqCtx, cancel := context.WithTimeout(ctx, e.timeout)
 		defer cancel()
-		if err := e.analyze(reqCtx, window, targetLen, prior, notes); err != nil {
-			e.handleAnalysisError(err, targetLen)
+		if err := e.analyze(reqCtx, job.window, job.targetLen, job.prior, job.notes); err != nil {
+			e.handleAnalysisError(err, job.targetLen)
 		}
 	}()
 }
@@ -383,8 +376,15 @@ func (e *Engine) snapshotAnalysisJob() (analysisJob, bool) {
 	if len(e.transcript) == e.analyzedLen {
 		return analysisJob{}, false
 	}
+	window := e.recentWindowLocked()
+	fingerprint := normalizedTranscriptFingerprint(window)
+	if fingerprint == "" || fingerprint == e.lastRequestFingerprint {
+		e.analyzedLen = len(e.transcript)
+		return analysisJob{}, false
+	}
+	e.lastRequestFingerprint = fingerprint
 	return analysisJob{
-		window:    e.recentWindowLocked(),
+		window:    window,
 		targetLen: len(e.transcript),
 		prior: priorView{
 			meetingSummary: e.state.Summary,
@@ -421,6 +421,19 @@ func (e *Engine) recentWindowLocked() string {
 		fmt.Fprintf(&b, "%s: %s\n", l.speaker, l.text)
 	}
 	return b.String()
+}
+
+func cleanTranscriptText(text string) string {
+	text = blankAudioTokenRE.ReplaceAllString(text, " ")
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+}
+
+func normalizedTranscriptFingerprint(text string) string {
+	text = cleanTranscriptText(text)
+	if text == "" {
+		return ""
+	}
+	return strings.ToLower(text)
 }
 
 type llmResult struct {
@@ -530,6 +543,8 @@ func (e *Engine) analyze(ctx context.Context, window string, targetLen int, prio
 	if e.emit != nil {
 		e.emit(snapshot)
 	}
+	log.Printf("[analysis] emitted update targetLen=%d title=%q summaryChars=%d assertions=%d suggestions=%d actions=%d",
+		targetLen, snapshot.Current.Title, len(snapshot.Summary), len(snapshot.Current.Assertions), len(snapshot.Suggestions), len(snapshot.ActionItems))
 	return nil
 }
 
@@ -549,7 +564,16 @@ func (e *Engine) requestAnalysis(ctx context.Context, messages []llm.Message) (s
 }
 
 func strictRetryPrompt(reply string) string {
+	reply = truncateForPrompt(reply, maxRetryResponseChars)
 	return "Your previous response was invalid for this task. Return only one minified JSON object using the required schema. Do not include reasoning, prose, markdown, or any keys outside the schema. Previous invalid response:\n" + reply
+}
+
+func truncateForPrompt(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "...[truncated]"
 }
 
 type analysisRunError struct {
@@ -739,6 +763,14 @@ func parseResult(reply string) (llmResult, error) {
 				lastErr = err
 				continue
 			}
+			if stateRes, ok := decodeStateShapedResult(fields); ok {
+				score := resultScore(stateRes)
+				if score >= bestScore {
+					best = stateRes
+					bestScore = score
+				}
+				continue
+			}
 			res := decodeLLMResult(fields)
 			if hasKnownLLMField(res.present) {
 				score := resultScore(res)
@@ -827,6 +859,45 @@ func decodeLLMResult(fields map[string]json.RawMessage) llmResult {
 	decodeValue(fields, "suggestions", &res.Suggestions)
 	decodeValue(fields, "actionItems", &res.ActionItems)
 	return res
+}
+
+func decodeStateShapedResult(fields map[string]json.RawMessage) (llmResult, bool) {
+	if _, hasCurrent := fields["current"]; !hasCurrent {
+		if _, hasSummary := fields["summary"]; !hasSummary {
+			return llmResult{}, false
+		}
+	}
+	res := llmResult{present: make(map[string]bool)}
+	if raw, ok := fields["summary"]; ok {
+		decodeString(map[string]json.RawMessage{"summary": raw}, "summary", &res.MeetingSummary)
+		res.present["meetingSummary"] = true
+	}
+	if raw, ok := fields["current"]; ok {
+		var topic Topic
+		if err := json.Unmarshal(raw, &topic); err == nil {
+			if strings.TrimSpace(topic.Title) != "" {
+				res.CurrentTopicTitle = topic.Title
+				res.present["currentTopicTitle"] = true
+			}
+			if strings.TrimSpace(topic.Summary) != "" {
+				res.CurrentTopicSummary = topic.Summary
+				res.present["currentTopicSummary"] = true
+			}
+			if topic.Assertions != nil {
+				res.Assertions = topic.Assertions
+				res.present["assertions"] = true
+			}
+		}
+	}
+	if raw, ok := fields["suggestions"]; ok {
+		_ = json.Unmarshal(raw, &res.Suggestions)
+		res.present["suggestions"] = true
+	}
+	if raw, ok := fields["actionItems"]; ok {
+		_ = json.Unmarshal(raw, &res.ActionItems)
+		res.present["actionItems"] = true
+	}
+	return res, hasKnownLLMField(res.present)
 }
 
 func decodeString(fields map[string]json.RawMessage, key string, dst *string) {

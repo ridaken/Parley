@@ -105,6 +105,48 @@ func TestChunkerSkipsSilence(t *testing.T) {
 	}
 }
 
+func TestChunkerDropsBlankAudioTranscript(t *testing.T) {
+	var calls atomic.Int32
+	srv := mockWhisper(t, " [BLANK_AUDIO] \n [blank_audio] ", &calls)
+	defer srv.Close()
+
+	segs := make(chan Segment, 1)
+	c := NewChunker(NewClient(srv.URL), time.Hour, func(s Segment) { segs <- s })
+
+	c.Feed(audio.You, loud(audio.SampleRate))
+	c.flush(context.Background())
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected whisper call before text cleanup, got %d", calls.Load())
+	}
+	select {
+	case seg := <-segs:
+		t.Fatalf("blank audio filler should not emit a segment: %+v", seg)
+	default:
+	}
+}
+
+func TestCleanTranscriptTextRemovesBlankAudioToken(t *testing.T) {
+	got := CleanTranscriptText(" hello  [BLANK_AUDIO]\nthere [blank_audio] ")
+	if got != "hello there" {
+		t.Fatalf("CleanTranscriptText = %q", got)
+	}
+	if got := CleanTranscriptText("[BLANK_AUDIO]"); got != "" {
+		t.Fatalf("filler-only transcript should be empty, got %q", got)
+	}
+}
+
+func TestShouldSkipLowEnergySpike(t *testing.T) {
+	samples := make([]int16, audio.SampleRate)
+	samples[100] = 900
+	if !shouldSkipAudio(samples) {
+		t.Fatal("single low-energy spike should be skipped")
+	}
+	if shouldSkipAudio(loud(audio.SampleRate)) {
+		t.Fatal("sustained loud audio should not be skipped")
+	}
+}
+
 func TestChunkerDoesNotOverlapSlowTranscriptions(t *testing.T) {
 	var current atomic.Int32
 	var maxConcurrent atomic.Int32
@@ -186,5 +228,14 @@ func TestPeakAmplitude(t *testing.T) {
 	}
 	if got := peakAmplitude(nil); got != 0 {
 		t.Fatalf("peakAmplitude(nil) = %d, want 0", got)
+	}
+}
+
+func TestRMSAmplitude(t *testing.T) {
+	if got := rmsAmplitude([]int16{3, 4}); got != 3 {
+		t.Fatalf("rmsAmplitude = %d, want 3", got)
+	}
+	if got := rmsAmplitude(nil); got != 0 {
+		t.Fatalf("rmsAmplitude(nil) = %d, want 0", got)
 	}
 }

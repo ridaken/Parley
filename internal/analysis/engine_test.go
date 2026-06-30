@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,30 @@ func TestParseResultAllowsMissingOptionalFields(t *testing.T) {
 	}
 	if res.CurrentTopicTitle != "Only title" || len(res.Assertions) != 0 || len(res.ActionItems) != 0 {
 		t.Fatalf("unexpected optional-field result: %+v", res)
+	}
+}
+
+func TestParseResultAcceptsStateShapedObject(t *testing.T) {
+	reply := `{"summary":"- Native state summary.","current":{"title":"Budget","summary":"Discussing spend.","assertions":[{"speaker":"Others","text":"Spend is high."}]},"suggestions":[{"kind":"question","text":"Why?"}],"actionItems":[{"text":"Send deck","owner":"Lee"}]}`
+	res, err := parseResult(reply)
+	if err != nil {
+		t.Fatalf("parseResult: %v", err)
+	}
+	if res.CurrentTopicTitle != "Budget" || res.CurrentTopicSummary != "Discussing spend." {
+		t.Fatalf("state-shaped topic not decoded: %+v", res)
+	}
+	if res.MeetingSummary != "- Native state summary." || len(res.Assertions) != 1 || len(res.Suggestions) != 1 || len(res.ActionItems) != 1 {
+		t.Fatalf("state-shaped fields not decoded: %+v", res)
+	}
+}
+
+func TestStrictRetryPromptTruncatesPreviousResponse(t *testing.T) {
+	prompt := strictRetryPrompt(strings.Repeat("x", maxRetryResponseChars+200))
+	if len(prompt) > maxRetryResponseChars+300 {
+		t.Fatalf("retry prompt was not bounded, len=%d", len(prompt))
+	}
+	if !contains(prompt, "...[truncated]") {
+		t.Fatalf("retry prompt missing truncation marker: %q", prompt)
 	}
 }
 
@@ -358,6 +383,12 @@ func TestAnalyzeFailureDoesNotConsumeTranscript(t *testing.T) {
 	}
 
 	eng.maybeAnalyze(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	if calls.Load() != 2 {
+		t.Fatalf("unchanged failed window should not be retried, calls=%d", calls.Load())
+	}
+	eng.Feed("Others", "new line should resume analysis")
+	eng.maybeAnalyze(context.Background())
 	select {
 	case s := <-emits:
 		if s.Current.Title != "Retry" || eng.analyzedLen == 0 {
@@ -541,7 +572,7 @@ func TestFlushAnalyzesPendingTranscript(t *testing.T) {
 func TestRepeatedAnalysisFailuresSkipBadWindowAndRecover(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) <= maxConsecutiveAnalysisFailures {
+		if calls.Add(1) == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": ""}}},
 			})
@@ -565,18 +596,27 @@ func TestRepeatedAnalysisFailuresSkipBadWindowAndRecover(t *testing.T) {
 	)
 	eng.Feed("Others", "bad window")
 
-	for i := 0; i < maxConsecutiveAnalysisFailures; i++ {
-		eng.analyzeOnce(context.Background())
+	eng.analyzeOnce(context.Background())
+	if eng.analyzedLen != 0 {
+		t.Fatalf("first failure should leave transcript pending, analyzedLen=%d", eng.analyzedLen)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("first failed request calls=%d, want 1", calls.Load())
+	}
+	eng.analyzeOnce(context.Background())
+	if calls.Load() != 1 {
+		t.Fatalf("unchanged failed window should not be retried, calls=%d", calls.Load())
 	}
 	if eng.analyzedLen != 1 {
-		t.Fatalf("repeated failures should skip bad window, analyzedLen=%d", eng.analyzedLen)
+		t.Fatalf("unchanged submitted window should be skipped, analyzedLen=%d", eng.analyzedLen)
 	}
-	var lastStatus string
-	for len(statuses) > 0 {
-		lastStatus = <-statuses
-	}
-	if !contains(lastStatus, "Skipped that transcript window") {
-		t.Fatalf("skip warning missing, got %q", lastStatus)
+	select {
+	case msg := <-statuses:
+		if !contains(msg, "Live analysis did not complete") {
+			t.Fatalf("unexpected status: %q", msg)
+		}
+	default:
+		t.Fatal("expected failure status")
 	}
 	select {
 	case s := <-emits:
@@ -600,11 +640,23 @@ func TestFeedIgnoresBlankLines(t *testing.T) {
 	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
 	eng.Feed("You", "   ")
 	eng.Feed("You", "")
+	eng.Feed("You", "[BLANK_AUDIO]")
 	eng.mu.Lock()
 	n := len(eng.transcript)
 	eng.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("blank lines should be dropped, transcript has %d", n)
+	}
+}
+
+func TestRestoreDropsBlankAudioLines(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	eng.Restore(State{}, nil, []struct{ Speaker, Text string }{
+		{"You", "[BLANK_AUDIO]"},
+		{"Others", "actual content"},
+	})
+	if len(eng.transcript) != 1 || eng.transcript[0].text != "actual content" {
+		t.Fatalf("restore should drop filler history, transcript=%+v", eng.transcript)
 	}
 }
 
