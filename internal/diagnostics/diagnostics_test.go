@@ -26,6 +26,9 @@ func TestLogAnalysisFailureHonorsLevels(t *testing.T) {
 	if !strings.Contains(string(data), "prompt") || !strings.Contains(string(data), "raw reply") {
 		t.Fatalf("trace log should include request/response: %s", data)
 	}
+	if strings.Contains(string(data), "maxAttempts") || strings.Contains(string(data), "skippedWindow") {
+		t.Fatalf("trace log should omit empty legacy retry fields: %s", data)
+	}
 
 	dir = t.TempDir()
 	if err := LogAnalysisFailure(dir, "error", event); err != nil {

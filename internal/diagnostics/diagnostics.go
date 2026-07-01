@@ -28,8 +28,8 @@ type AnalysisFailure struct {
 	Kind             string    `json:"kind"`
 	Error            string    `json:"error"`
 	Attempt          int       `json:"attempt"`
-	MaxAttempts      int       `json:"maxAttempts"`
-	SkippedWindow    bool      `json:"skippedWindow"`
+	MaxAttempts      int       `json:"maxAttempts,omitempty"`
+	SkippedWindow    bool      `json:"skippedWindow,omitempty"`
 	TargetLen        int       `json:"targetLen"`
 	PendingLineCount int       `json:"pendingLineCount,omitempty"`
 	TimeoutMs        int64     `json:"timeoutMs,omitempty"`
