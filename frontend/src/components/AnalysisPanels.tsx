@@ -28,18 +28,16 @@ import { cn } from "@/lib/utils";
 function Panel({
   title,
   icon,
-  scroll = true,
   className,
   children,
 }: {
   title: string;
   icon: ReactNode;
-  scroll?: boolean;
   className?: string;
   children: ReactNode;
 }) {
   return (
-    <Card className={cn("min-h-0", className)}>
+    <Card className={cn("min-h-0 overflow-hidden", className)}>
       <CardHeader>
         <CardTitle className="text-sm">
           {icon}
@@ -47,11 +45,7 @@ function Panel({
         </CardTitle>
       </CardHeader>
       <CardContent className="flex-1 min-h-0 p-0">
-        {scroll ? (
-          <ScrollArea className="h-full px-4 pb-3">{children}</ScrollArea>
-        ) : (
-          <div className="px-4 pb-3">{children}</div>
-        )}
+        <ScrollArea className="h-full px-4 pb-3">{children}</ScrollArea>
       </CardContent>
     </Card>
   );
@@ -237,7 +231,6 @@ export function AnalysisPanels({
         <Panel
           title="Current topic"
           icon={<MessageSquareText className="h-4 w-4 text-primary" />}
-          scroll={false}
         >
           {hasTopic ? (
             <div className="flex flex-col gap-2 py-1">
@@ -281,19 +274,71 @@ export function AnalysisPanels({
         </Panel>
       </div>
 
-      <Panel
-        title="Live summary"
-        icon={<FileText className="h-4 w-4 text-primary" />}
-        className="h-40 shrink-0"
-      >
-        <SummaryContent summary={summary} />
-      </Panel>
+      <div className="grid h-40 shrink-0 grid-cols-2 gap-4">
+        <Panel title="Assertions" icon={<ListChecks className="h-4 w-4 text-others" />}>
+          {assertions.length ? (
+            <ul className="flex flex-col gap-2 py-1">
+              {assertions.map((a) => {
+                const key = normKey(a.text);
+                return (
+                  <li
+                    key={key}
+                    className={cn(
+                      "flex gap-2 rounded-md p-1",
+                      newAssertions.has(key) && NEW_HIGHLIGHT
+                    )}
+                  >
+                    <Badge variant={speakerVariant(a.speaker)}>{a.speaker}</Badge>
+                    <span className="text-sm leading-snug">{a.text}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <Empty>Points made on the current topic will appear here.</Empty>
+          )}
+        </Panel>
 
-      <div className="grid min-h-0 flex-1 grid-cols-2 grid-rows-2 gap-4">
+        <Panel
+          title="Action items"
+          icon={<CheckSquare className="h-4 w-4 text-primary" />}
+        >
+          {actionItems.length ? (
+            <ul className="flex flex-col gap-2 py-1">
+              {actionItems.map((a) => {
+                const key = normKey(a.text);
+                return (
+                  <li
+                    key={key}
+                    className={cn(
+                      "group flex items-start gap-2 rounded-md bg-accent/40 p-2",
+                      newActions.has(key) && NEW_HIGHLIGHT
+                    )}
+                  >
+                    <span className="min-w-0 flex-1 text-sm leading-snug">
+                      {a.text}
+                    </span>
+                    <Badge
+                      variant={a.owner ? "you" : "outline"}
+                      className="shrink-0"
+                    >
+                      {a.owner || "Unassigned"}
+                    </Badge>
+                    <ItemActions onCopy={() => copyText(a.text)} />
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <Empty>Action items will collect here as the meeting progresses.</Empty>
+          )}
+        </Panel>
+      </div>
+
+      <div className="grid min-h-0 flex-1 grid-cols-2 gap-4">
         <Panel
           title="Suggested questions"
           icon={<Lightbulb className="h-4 w-4 text-amber-400" />}
-          className="row-span-2"
         >
           {suggestions.length ? (
             <ul className="flex flex-col gap-2 py-1">
@@ -334,64 +379,11 @@ export function AnalysisPanels({
         </Panel>
 
         <Panel
-          title="Action items"
-          icon={<CheckSquare className="h-4 w-4 text-primary" />}
+          title="Live summary"
+          icon={<FileText className="h-4 w-4 text-primary" />}
         >
-          {actionItems.length ? (
-            <ul className="flex flex-col gap-2 py-1">
-              {actionItems.map((a) => {
-                const key = normKey(a.text);
-                return (
-                  <li
-                    key={key}
-                    className={cn(
-                      "group flex items-start gap-2 rounded-md bg-accent/40 p-2",
-                      newActions.has(key) && NEW_HIGHLIGHT
-                    )}
-                  >
-                    <span className="min-w-0 flex-1 text-sm leading-snug">
-                      {a.text}
-                    </span>
-                    <Badge
-                      variant={a.owner ? "you" : "outline"}
-                      className="shrink-0"
-                    >
-                      {a.owner || "Unassigned"}
-                    </Badge>
-                    <ItemActions onCopy={() => copyText(a.text)} />
-                  </li>
-                );
-              })}
-            </ul>
-          ) : (
-            <Empty>Action items will collect here as the meeting progresses.</Empty>
-          )}
+          <SummaryContent summary={summary} />
         </Panel>
-
-        <Panel title="Assertions" icon={<ListChecks className="h-4 w-4 text-others" />}>
-          {assertions.length ? (
-            <ul className="flex flex-col gap-2 py-1">
-              {assertions.map((a) => {
-                const key = normKey(a.text);
-                return (
-                  <li
-                    key={key}
-                    className={cn(
-                      "flex gap-2 rounded-md p-1",
-                      newAssertions.has(key) && NEW_HIGHLIGHT
-                    )}
-                  >
-                    <Badge variant={speakerVariant(a.speaker)}>{a.speaker}</Badge>
-                    <span className="text-sm leading-snug">{a.text}</span>
-                  </li>
-                );
-              })}
-            </ul>
-          ) : (
-            <Empty>Points made on the current topic will appear here.</Empty>
-          )}
-        </Panel>
-
       </div>
     </div>
   );

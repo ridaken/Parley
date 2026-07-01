@@ -3,6 +3,9 @@ package stt
 import (
 	"context"
 	"log"
+	"math"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +24,13 @@ type Segment struct {
 // considered worth transcribing. Avoids feeding whisper near-silent buffers
 // (which can hallucinate text).
 const silenceThreshold = 350
+
+const (
+	lowEnergyThreshold = 80
+	lowEnergyPeakLimit = 1200
+)
+
+var blankAudioRE = regexp.MustCompile(`(?i)\[blank_audio\]`)
 
 // Chunker accumulates per-source samples and, on a fixed interval, transcribes
 // each source's buffered audio and reports a Segment.
@@ -132,6 +142,11 @@ func (c *Chunker) flush(ctx context.Context) {
 		if len(st.pending) == 0 {
 			continue
 		}
+		pendingMs := int64(len(st.pending)) * 1000 / int64(audio.SampleRate)
+		windowMs := c.window.Milliseconds()
+		if windowMs > 0 && pendingMs > 2*windowMs {
+			log.Printf("[stt] transcription backlog source=%s pending=%dms window=%dms", src, pendingMs, windowMs)
+		}
 		for len(st.pending) > 0 {
 			n := len(st.pending)
 			if n > maxSamples {
@@ -155,8 +170,8 @@ func (c *Chunker) flush(ctx context.Context) {
 			return
 		default:
 		}
-		if peakAmplitude(j.samples) < silenceThreshold {
-			continue // skip silent windows
+		if shouldSkipAudio(j.samples) {
+			continue // skip silent or low-energy windows
 		}
 		start := time.Now()
 		audioMs := j.endMs - j.startMs
@@ -166,15 +181,37 @@ func (c *Chunker) flush(ctx context.Context) {
 				j.src, j.startMs, j.endMs, audioMs, time.Since(start).Round(time.Millisecond), err)
 			continue
 		}
+		text = CleanTranscriptText(text)
 		if text == "" {
 			log.Printf("[stt] transcribe empty source=%s start=%dms end=%dms audio=%dms duration=%s",
 				j.src, j.startMs, j.endMs, audioMs, time.Since(start).Round(time.Millisecond))
 			continue
 		}
-		log.Printf("[stt] transcribed source=%s start=%dms end=%dms audio=%dms duration=%s",
-			j.src, j.startMs, j.endMs, audioMs, time.Since(start).Round(time.Millisecond))
+		duration := time.Since(start).Round(time.Millisecond)
+		if duration.Milliseconds() > audioMs {
+			log.Printf("[stt] transcribed source=%s start=%dms end=%dms audio=%dms duration=%s lagging=true",
+				j.src, j.startMs, j.endMs, audioMs, duration)
+		} else {
+			log.Printf("[stt] transcribed source=%s start=%dms end=%dms audio=%dms duration=%s",
+				j.src, j.startMs, j.endMs, audioMs, duration)
+		}
 		c.onSegment(Segment{Source: j.src, Text: text, StartMs: j.startMs, EndMs: j.endMs})
 	}
+}
+
+// CleanTranscriptText removes whisper.cpp filler tokens that are not useful
+// transcript content. A result containing only filler is treated as empty.
+func CleanTranscriptText(text string) string {
+	text = blankAudioRE.ReplaceAllString(text, " ")
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+}
+
+func shouldSkipAudio(samples []int16) bool {
+	peak := peakAmplitude(samples)
+	if peak < silenceThreshold {
+		return true
+	}
+	return peak < lowEnergyPeakLimit && rmsAmplitude(samples) < lowEnergyThreshold
 }
 
 func peakAmplitude(samples []int16) int {
@@ -189,4 +226,16 @@ func peakAmplitude(samples []int16) int {
 		}
 	}
 	return peak
+}
+
+func rmsAmplitude(samples []int16) int {
+	if len(samples) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range samples {
+		x := float64(v)
+		sum += x * x
+	}
+	return int(math.Sqrt(sum / float64(len(samples))))
 }

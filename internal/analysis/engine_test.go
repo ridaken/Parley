@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,31 @@ func TestParseResultAllowsMissingOptionalFields(t *testing.T) {
 	}
 	if res.CurrentTopicTitle != "Only title" || len(res.Assertions) != 0 || len(res.ActionItems) != 0 {
 		t.Fatalf("unexpected optional-field result: %+v", res)
+	}
+}
+
+func TestParseResultAcceptsStateShapedObject(t *testing.T) {
+	reply := `{"summary":"- Native state summary.","current":{"title":"Budget","summary":"Discussing spend.","assertions":[{"speaker":"Others","text":"Spend is high."}]},"suggestions":[{"kind":"question","text":"Why?"}],"actionItems":[{"text":"Send deck","owner":"Lee"}]}`
+	res, err := parseResult(reply)
+	if err != nil {
+		t.Fatalf("parseResult: %v", err)
+	}
+	if res.CurrentTopicTitle != "Budget" || res.CurrentTopicSummary != "Discussing spend." {
+		t.Fatalf("state-shaped topic not decoded: %+v", res)
+	}
+	if res.MeetingSummary != "- Native state summary." || len(res.Assertions) != 1 || len(res.Suggestions) != 1 || len(res.ActionItems) != 1 {
+		t.Fatalf("state-shaped fields not decoded: %+v", res)
+	}
+}
+
+func TestBuildUserPromptDisablesThinkingMode(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	prompt := eng.buildUserPrompt("You: hi\n", priorView{}, nil)
+	if !strings.HasPrefix(prompt, "/no_think\n") {
+		t.Fatalf("user prompt should start with no_think directive:\n%s", prompt)
+	}
+	if !contains(prompt, "Start with { and end with }") {
+		t.Fatalf("user prompt missing JSON boundary instruction:\n%s", prompt)
 	}
 }
 
@@ -322,15 +348,23 @@ func TestFeedThenAnalyzeEmitsAndThenSkipsWithoutNewContent(t *testing.T) {
 
 func TestAnalyzeFailureDoesNotConsumeTranscript(t *testing.T) {
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) <= 2 {
+	requests := make(chan string, 3)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []llm.Message `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Messages) > 1 {
+			requests <- req.Messages[1].Content
+		}
+		if calls.Add(1) == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{"message": map[string]any{"content": "{not valid json"}}},
 			})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{{"message": map[string]any{"content": `{"currentTopicTitle":"Retry","currentTopicSummary":"Recovered.","meetingSummary":"- Recovered after retry.","topicChanged":false,"assertions":[],"suggestions":[]}`}}},
+			"choices": []map[string]any{{"message": map[string]any{"content": `{"currentTopicTitle":"Fresh","currentTopicSummary":"Recovered.","meetingSummary":"- Recovered after fresh request.","topicChanged":false,"assertions":[],"suggestions":[]}`}}},
 		})
 	}))
 	defer srv.Close()
@@ -358,46 +392,53 @@ func TestAnalyzeFailureDoesNotConsumeTranscript(t *testing.T) {
 	}
 
 	eng.maybeAnalyze(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("unchanged failed window should not be retried, calls=%d", calls.Load())
+	}
+	eng.Feed("Others", "new line should resume analysis")
+	eng.maybeAnalyze(context.Background())
 	select {
 	case s := <-emits:
-		if s.Current.Title != "Retry" || eng.analyzedLen == 0 {
-			t.Fatalf("retry did not analyze transcript: state=%+v analyzedLen=%d", s, eng.analyzedLen)
+		if s.Current.Title != "Fresh" || eng.analyzedLen == 0 {
+			t.Fatalf("fresh request did not analyze transcript: state=%+v analyzedLen=%d", s, eng.analyzedLen)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("retry did not emit")
+		t.Fatal("fresh request did not emit")
+	}
+
+	firstPrompt := <-requests
+	freshPrompt := <-requests
+	if !contains(firstPrompt, "first line should be retried") || contains(firstPrompt, "new line should resume analysis") {
+		t.Fatalf("first request should contain only initial pending line:\n%s", firstPrompt)
+	}
+	if !contains(freshPrompt, "first line should be retried") || !contains(freshPrompt, "new line should resume analysis") {
+		t.Fatalf("fresh request should contain all pending transcript:\n%s", freshPrompt)
 	}
 }
 
-func TestAnalyzeRetriesMalformedModelResponse(t *testing.T) {
+func TestAnalyzeDoesNotRetryMalformedModelResponse(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"choices": []map[string]any{{"message": map[string]any{"content": "The user wants me to update notes. I should output JSON."}}},
-			})
-			return
-		}
+		calls.Add(1)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{{"message": map[string]any{"content": `{"currentTopicTitle":"Recovered","currentTopicSummary":"Retry worked.","meetingSummary":"- Retry worked.","topicChanged":false,"assertions":[],"suggestions":[]}`}}},
+			"choices": []map[string]any{{"message": map[string]any{"content": "The user wants me to update notes. I should output JSON."}}},
 		})
 	}))
 	defer srv.Close()
 
 	emits := make(chan State, 1)
 	eng := NewEngine(llm.NewClient(srv.URL, "", "m"), 3*time.Second, Context{}, func(s State) { emits <- s })
-	if err := eng.analyze(context.Background(), "Others: discuss retry\n", 1, priorView{}, nil); err != nil {
-		t.Fatalf("analyze should recover on retry: %v", err)
+	if err := eng.analyze(context.Background(), "Others: discuss malformed output\n", 1, priorView{}, nil); err == nil {
+		t.Fatal("analyze should fail malformed response without retry")
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("expected malformed response + retry, got %d calls", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("expected one malformed response call, got %d", calls.Load())
 	}
 	select {
 	case s := <-emits:
-		if s.Current.Title != "Recovered" {
-			t.Fatalf("state not recovered from retry: %+v", s)
-		}
+		t.Fatalf("malformed response should not emit state: %+v", s)
 	default:
-		t.Fatal("expected recovered state emit")
 	}
 }
 
@@ -438,6 +479,9 @@ func TestAnalysisFailureLoggerReceivesRequestResponseAndSessionContext(t *testin
 	}
 	if ev.Kind != "parse" || ev.Response == "" || len(ev.Request) == 0 {
 		t.Fatalf("missing parse diagnostics: %+v", ev)
+	}
+	if ev.PendingLineCount != 1 || ev.Timeout != time.Second || ev.TotalElapsed <= 0 || ev.Elapsed <= 0 {
+		t.Fatalf("missing timing/pending diagnostics: %+v", ev)
 	}
 }
 
@@ -538,10 +582,10 @@ func TestFlushAnalyzesPendingTranscript(t *testing.T) {
 	}
 }
 
-func TestRepeatedAnalysisFailuresSkipBadWindowAndRecover(t *testing.T) {
+func TestUnchangedFailedPendingWindowWaitsForNewTranscript(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) <= maxConsecutiveAnalysisFailures {
+		if calls.Add(1) == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": ""}}},
 			})
@@ -554,7 +598,7 @@ func TestRepeatedAnalysisFailuresSkipBadWindowAndRecover(t *testing.T) {
 	defer srv.Close()
 
 	emits := make(chan State, 1)
-	statuses := make(chan string, maxConsecutiveAnalysisFailures+1)
+	statuses := make(chan string, 2)
 	eng := NewEngineWithTimeout(
 		llm.NewClient(srv.URL, "", "m"),
 		3*time.Second,
@@ -565,18 +609,30 @@ func TestRepeatedAnalysisFailuresSkipBadWindowAndRecover(t *testing.T) {
 	)
 	eng.Feed("Others", "bad window")
 
-	for i := 0; i < maxConsecutiveAnalysisFailures; i++ {
-		eng.analyzeOnce(context.Background())
+	eng.analyzeOnce(context.Background())
+	if eng.analyzedLen != 0 {
+		t.Fatalf("first failure should leave transcript pending, analyzedLen=%d", eng.analyzedLen)
 	}
-	if eng.analyzedLen != 1 {
-		t.Fatalf("repeated failures should skip bad window, analyzedLen=%d", eng.analyzedLen)
+	if calls.Load() != 1 {
+		t.Fatalf("first failed request calls=%d, want 1", calls.Load())
 	}
-	var lastStatus string
-	for len(statuses) > 0 {
-		lastStatus = <-statuses
+	eng.analyzeOnce(context.Background())
+	if calls.Load() != 1 {
+		t.Fatalf("unchanged failed window should not be retried, calls=%d", calls.Load())
 	}
-	if !contains(lastStatus, "Skipped that transcript window") {
-		t.Fatalf("skip warning missing, got %q", lastStatus)
+	if eng.analyzedLen != 0 {
+		t.Fatalf("unchanged failed window should remain pending, analyzedLen=%d", eng.analyzedLen)
+	}
+	select {
+	case msg := <-statuses:
+		if !contains(msg, "Live analysis did not complete") {
+			t.Fatalf("unexpected status: %q", msg)
+		}
+		if !contains(msg, "Pending transcript will be analyzed with the next fresh request") {
+			t.Fatalf("status should describe pending fresh request behavior: %q", msg)
+		}
+	default:
+		t.Fatal("expected failure status")
 	}
 	select {
 	case s := <-emits:
@@ -600,6 +656,7 @@ func TestFeedIgnoresBlankLines(t *testing.T) {
 	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
 	eng.Feed("You", "   ")
 	eng.Feed("You", "")
+	eng.Feed("You", "[BLANK_AUDIO]")
 	eng.mu.Lock()
 	n := len(eng.transcript)
 	eng.mu.Unlock()
@@ -608,13 +665,24 @@ func TestFeedIgnoresBlankLines(t *testing.T) {
 	}
 }
 
-func TestRecentWindowCapsAtPromptWindow(t *testing.T) {
+func TestRestoreDropsBlankAudioLines(t *testing.T) {
 	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
-	for i := 0; i < promptWindowLines+10; i++ {
-		eng.Feed("You", "a line of talk")
+	eng.Restore(State{}, nil, []struct{ Speaker, Text string }{
+		{"You", "[BLANK_AUDIO]"},
+		{"Others", "actual content"},
+	})
+	if len(eng.transcript) != 1 || eng.transcript[0].text != "actual content" {
+		t.Fatalf("restore should drop filler history, transcript=%+v", eng.transcript)
+	}
+}
+
+func TestPendingWindowIncludesAllRetainedUnprocessedTranscript(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	for i := 0; i < maxTranscriptLines+10; i++ {
+		eng.Feed("You", fmt.Sprintf("a line of talk %d", i))
 	}
 	eng.mu.Lock()
-	window := eng.recentWindowLocked()
+	window := eng.pendingWindowLocked()
 	eng.mu.Unlock()
 
 	lines := 0
@@ -623,8 +691,34 @@ func TestRecentWindowCapsAtPromptWindow(t *testing.T) {
 			lines++
 		}
 	}
-	if lines != promptWindowLines {
-		t.Fatalf("window has %d lines, want %d", lines, promptWindowLines)
+	if lines != maxTranscriptLines {
+		t.Fatalf("window has %d lines, want %d", lines, maxTranscriptLines)
+	}
+	if contains(window, "a line of talk 0") || !contains(window, fmt.Sprintf("a line of talk %d", maxTranscriptLines+9)) {
+		t.Fatalf("pending window should contain the retained tail:\n%s", window)
+	}
+}
+
+func TestFeedAdjustsAnalyzedCursorWhenTranscriptIsTrimmed(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	for i := 0; i < 10; i++ {
+		eng.Feed("You", fmt.Sprintf("already analyzed %d", i))
+	}
+	eng.analyzedLen = 10
+
+	for i := 0; i < maxTranscriptLines; i++ {
+		eng.Feed("Others", fmt.Sprintf("pending %d", i))
+	}
+
+	if len(eng.transcript) != maxTranscriptLines {
+		t.Fatalf("transcript len=%d, want retained cap %d", len(eng.transcript), maxTranscriptLines)
+	}
+	if eng.analyzedLen != 0 {
+		t.Fatalf("analyzed cursor should move with trimmed lines, got %d", eng.analyzedLen)
+	}
+	window := eng.pendingWindowLocked()
+	if contains(window, "already analyzed") || !contains(window, "pending 0") || !contains(window, fmt.Sprintf("pending %d", maxTranscriptLines-1)) {
+		t.Fatalf("pending window should include retained unprocessed transcript:\n%s", window)
 	}
 }
 
@@ -795,6 +889,7 @@ func TestBuildUserPromptIncludesUnderstanding(t *testing.T) {
 	prompt := eng.buildUserPrompt("You: hi\n", prior, nil)
 	for _, want := range []string{
 		"INPUT_JSON",
+		`"unprocessedTranscript": "You: hi\n"`,
 		`"meetingSummary": "- Budget is over target."`,
 		"Discussing Q3 spend.",
 		`"speaker": "Others"`,
