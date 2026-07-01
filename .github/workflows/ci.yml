@@ -149,6 +149,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --prerelease --title "Latest build" --notes $notes --target $env:GITHUB_SHA
           } else {
-            gh release edit $tag --notes $notes
+            gh release edit $tag --notes $notes --target $env:GITHUB_SHA
           }
           gh release upload $tag bin/Parley-Setup.exe --clobber

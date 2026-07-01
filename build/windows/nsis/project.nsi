@@ -102,7 +102,7 @@ Section
 
     # When updating, close any running instance so its locked files (Parley.exe,
     # whisper DLLs) can be overwritten. Harmless no-op on a fresh install.
-    nsExec::Exec 'taskkill /F /IM "${PRODUCT_EXECUTABLE}"'
+    nsExec::Exec 'cmd /C taskkill /F /IM "${PRODUCT_EXECUTABLE}" >NUL 2>&1'
     Pop $0
 
     !insertmacro wails.webview2runtime
