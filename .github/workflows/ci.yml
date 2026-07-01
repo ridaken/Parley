@@ -59,3 +59,96 @@ jobs:
       - run: npm install --no-audit --no-fund
       # `npm run build` runs `tsc` (typecheck) then `vite build` (production bundle).
       - run: npm run build
+
+  # Builds the Windows NSIS installer and publishes it to a rolling "latest"
+  # prerelease. Runs only after the gates above pass, and only on a real merge to
+  # main (not on PRs). The published Parley-Setup.exe both installs fresh and
+  # updates an existing installation in place.
+  installer:
+    name: Windows installer
+    needs: [go, frontend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: installer-release
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # CGO is required (github.com/gen2brain/malgo). windows-latest ships MinGW;
+      # install it only if gcc is somehow absent.
+      - name: Ensure C compiler
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) { choco install mingw -y }
+          gcc --version
+
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.109
+          "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install NSIS
+        run: |
+          choco install nsis -y
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # The whisper engine + model are gitignored and ~180 MB; cache them keyed on
+      # the fetch script so they download once, not every run.
+      - name: Cache whisper engine + model
+        id: whisper-cache
+        uses: actions/cache@v4
+        with:
+          path: resources/whisper
+          key: whisper-${{ hashFiles('scripts/setup-whisper.ps1') }}
+
+      - name: Fetch whisper engine + model
+        if: steps.whisper-cache.outputs.cache-hit != 'true'
+        run: wails3 task setup:whisper
+
+      # Version = config.yml major.minor + CI run number, e.g. 0.1.42. Unique and
+      # increasing per merge; shown in Add/Remove Programs and used for updates.
+      - name: Compute version
+        id: ver
+        run: |
+          $cfg = Get-Content build/config.yml -Raw
+          if ($cfg -match 'version:\s*"([0-9]+)\.([0-9]+)') { $major = $matches[1]; $minor = $matches[2] }
+          else { $major = '0'; $minor = '1' }
+          $version = "$major.$minor.${{ github.run_number }}"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Installer version: $version"
+
+      - name: Build installer
+        run: |
+          wails3 task windows:package INSTALL_SCOPE=user PRODUCT_VERSION=${{ steps.ver.outputs.version }}
+          Copy-Item bin/Parley-amd64-installer.exe bin/Parley-Setup.exe -Force
+
+      # Publish to a single rolling "latest" prerelease, replacing the asset each
+      # time so the download URL stays stable:
+      #   .../releases/download/latest/Parley-Setup.exe
+      - name: Publish to rolling latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "latest"
+          $notes = "Automated build ${{ steps.ver.outputs.version }} - commit $env:GITHUB_SHA"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --prerelease --title "Latest build" --notes $notes --target $env:GITHUB_SHA
+          } else {
+            gh release edit $tag --notes $notes --target $env:GITHUB_SHA
+          }
+          gh release upload $tag bin/Parley-Setup.exe --clobber

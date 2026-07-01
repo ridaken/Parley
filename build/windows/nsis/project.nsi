@@ -82,24 +82,59 @@ ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
    !insertmacro wails.checkArchitecture
+
+   # On update, honor the location of a previously installed copy (recorded below
+   # as InstallLocation) so we overwrite it in place instead of installing a
+   # second copy when the user picked a non-default directory.
+   SetRegView 64
+   !if "${WAILS_INSTALL_SCOPE}" == "user"
+       ReadRegStr $0 HKCU "${UNINST_KEY}" "InstallLocation"
+   !else
+       ReadRegStr $0 HKLM "${UNINST_KEY}" "InstallLocation"
+   !endif
+   ${If} $0 != ""
+       StrCpy $INSTDIR $0
+   ${EndIf}
 FunctionEnd
 
 Section
     !insertmacro wails.setShellContext
 
+    # When updating, close any running instance so its locked files (Parley.exe,
+    # whisper DLLs) can be overwritten. Harmless no-op on a fresh install.
+    nsExec::Exec 'cmd /C taskkill /F /IM "${PRODUCT_EXECUTABLE}" >NUL 2>&1'
+    Pop $0
+
     !insertmacro wails.webview2runtime
 
     SetOutPath $INSTDIR
-    
+
     !insertmacro wails.files
+
+    # Bundle the whisper transcription engine + model so the installed app is standalone.
+    # resolveResource() in paths.go looks for resources/ next to the exe at runtime.
+    # Remove the previous copy first so stale/renamed engine or model files don't
+    # accumulate across updates (resources/ holds only shipped artifacts).
+    RMDir /r "$INSTDIR\resources"
+    File /r "..\..\..\resources"
+
+    SetOutPath $INSTDIR
 
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
 
     !insertmacro wails.associateFiles
     !insertmacro wails.associateCustomProtocols
-    
+
     !insertmacro wails.writeUninstaller
+
+    # Record where we installed so a future update can find and overwrite this copy.
+    SetRegView 64
+    !if "${WAILS_INSTALL_SCOPE}" == "user"
+        WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+    !else
+        WriteRegStr HKLM "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+    !endif
 SectionEnd
 
 Section "uninstall" 
