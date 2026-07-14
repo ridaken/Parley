@@ -11,11 +11,21 @@ import (
 	"github.com/tomvokac/parley/internal/audio"
 )
 
-const streamTranscriptEmitInterval = time.Second
+const (
+	// Keep transcript rows readable while still bounding how long an unpunctuated
+	// utterance can grow (for example, dictation without sentence punctuation).
+	streamTranscriptMaxWords = 12
+
+	// RNNT decoding can retain the last token until it sees an utterance boundary.
+	// Closing the stream after three silent 320 ms frames flushes that token while
+	// keeping brief, natural pauses inside the same utterance.
+	streamSilenceFinalizeAfter = 960 * time.Millisecond
+)
 
 // StreamingChunker feeds short audio frames into persistent cache-aware model
-// streams. Model token deltas are coalesced into roughly one-second transcript
-// segments so the UI stays fresh without storing every word as a separate row.
+// streams. Model token deltas are coalesced into sentences (or bounded word
+// groups when punctuation is absent) so the UI stays fresh without storing every
+// word as a separate row.
 type StreamingChunker struct {
 	client    *Client
 	window    time.Duration
@@ -33,6 +43,7 @@ type streamState struct {
 	flushedMs   int64
 	started     bool
 	lastEmitMs  int64
+	silenceMs   int64
 	pendingText strings.Builder
 }
 
@@ -147,27 +158,37 @@ func (c *StreamingChunker) flush(ctx context.Context) {
 		default:
 		}
 
+		voiced := !shouldSkipAudio(job.samples)
 		c.mu.Lock()
 		st := c.buf[job.src]
 		if !st.started {
-			if shouldSkipAudio(job.samples) {
+			if !voiced {
 				c.mu.Unlock()
 				continue
 			}
 			st.started = true
 			st.lastEmitMs = job.startMs
+			st.silenceMs = 0
+		} else if voiced {
+			st.silenceMs = 0
+		} else {
+			st.silenceMs += job.endMs - job.startMs
 		}
+		finalizeAfterPause := !voiced && st.silenceMs >= streamSilenceFinalizeAfter.Milliseconds()
 		c.mu.Unlock()
 
 		started := time.Now()
 		delta, err := c.client.StreamFeed(ctx, string(job.src), audio.EncodeMonoWAV(audio.SampleRate, job.samples))
 		if err != nil {
 			log.Printf("[stt] streaming feed failed source=%s start=%dms end=%dms: %v", job.src, job.startMs, job.endMs, err)
-			continue
+		} else {
+			c.acceptDelta(job.src, delta, job.endMs, false)
 		}
-		c.acceptDelta(job.src, delta, job.endMs, false)
 		if elapsed := time.Since(started); elapsed > c.window {
 			log.Printf("[stt] streaming frame lag source=%s audio=%s duration=%s", job.src, c.window, elapsed.Round(time.Millisecond))
+		}
+		if finalizeAfterPause {
+			c.finishStream(ctx, job.src, job.endMs)
 		}
 	}
 }
@@ -183,39 +204,101 @@ func (c *StreamingChunker) finishStreams(ctx context.Context) {
 	c.mu.Unlock()
 
 	for _, src := range sources {
-		delta, err := c.client.StreamFinish(ctx, string(src))
-		if err != nil {
-			log.Printf("[stt] streaming finish failed source=%s: %v", src, err)
-		}
 		c.mu.Lock()
 		endMs := c.buf[src].flushedMs
 		c.mu.Unlock()
-		c.acceptDelta(src, delta, endMs, true)
+		c.finishStream(ctx, src, endMs)
 	}
+}
+
+func (c *StreamingChunker) finishStream(ctx context.Context, src audio.Source, endMs int64) {
+	delta, err := c.client.StreamFinish(ctx, string(src))
+	if err != nil {
+		log.Printf("[stt] streaming finish failed source=%s: %v", src, err)
+	}
+
+	c.mu.Lock()
+	if st := c.buf[src]; st != nil {
+		st.started = false
+		st.silenceMs = 0
+	}
+	c.mu.Unlock()
+
+	// Flush text already returned by earlier feeds even when the finish request
+	// itself fails. On success, delta also contains the decoder's withheld tail.
+	c.acceptDelta(src, delta, endMs, true)
 }
 
 func (c *StreamingChunker) acceptDelta(src audio.Source, delta string, endMs int64, final bool) {
 	c.mu.Lock()
 	st := c.buf[src]
-	st.pendingText.WriteString(delta)
-	raw := st.pendingText.String()
-	trimmed := strings.TrimSpace(raw)
-	shouldEmit := final || (trimmed != "" && (endMs-st.lastEmitMs >= streamTranscriptEmitInterval.Milliseconds() || endsSentence(trimmed)))
-	if !shouldEmit {
+	if st == nil {
 		c.mu.Unlock()
 		return
 	}
-	text := CleanTranscriptText(raw)
+	st.pendingText.WriteString(delta)
+	ready, remainder := splitTranscript(st.pendingText.String(), final)
 	st.pendingText.Reset()
+	if remainder != "" {
+		st.pendingText.WriteString(remainder)
+	}
 	startMs := st.lastEmitMs
-	st.lastEmitMs = endMs
+	if len(ready) > 0 || final {
+		st.lastEmitMs = endMs
+	}
 	c.mu.Unlock()
 
-	if text != "" {
-		c.onSegment(Segment{Source: src, Text: text, StartMs: startMs, EndMs: endMs})
+	if len(ready) == 0 {
+		return
+	}
+	totalWords := 0
+	for _, text := range ready {
+		totalWords += len(strings.Fields(text))
+	}
+	emittedWords := 0
+	for _, text := range ready {
+		emittedWords += len(strings.Fields(text))
+		segmentEndMs := endMs
+		if totalWords > 0 {
+			segmentEndMs = startMs + (endMs-startMs)*int64(emittedWords)/int64(totalWords)
+		}
+		c.onSegment(Segment{Source: src, Text: text, StartMs: startMs, EndMs: segmentEndMs})
+		startMs = segmentEndMs
 	}
 }
 
-func endsSentence(text string) bool {
-	return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "?") || strings.HasSuffix(text, "!")
+func splitTranscript(text string, final bool) (ready []string, remainder string) {
+	hadTrailingSpace := strings.TrimRight(text, " \t\r\n") != text
+	words := strings.Fields(CleanTranscriptText(text))
+	for len(words) > 0 {
+		boundary := 0
+		for i, word := range words {
+			if endsSentence(word) {
+				boundary = i + 1
+				break
+			}
+			if i+1 == streamTranscriptMaxWords {
+				boundary = streamTranscriptMaxWords
+				break
+			}
+		}
+		if boundary == 0 {
+			if !final {
+				break
+			}
+			boundary = len(words)
+		}
+		ready = append(ready, strings.Join(words[:boundary], " "))
+		words = words[boundary:]
+	}
+	remainder = strings.Join(words, " ")
+	if remainder != "" && hadTrailingSpace {
+		remainder += " "
+	}
+	return ready, remainder
+}
+
+func endsSentence(word string) bool {
+	word = strings.TrimRight(word, "\"'”’)]}")
+	return strings.HasSuffix(word, ".") || strings.HasSuffix(word, "?") || strings.HasSuffix(word, "!")
 }
