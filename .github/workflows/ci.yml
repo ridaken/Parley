@@ -106,8 +106,8 @@ jobs:
           choco install nsis -y
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      # The whisper engine + model are gitignored and ~180 MB; cache them keyed on
-      # the fetch script so they download once, not every run.
+      # The CPU/CUDA whisper engines + model are gitignored and large; cache them
+      # keyed on the fetch script so they download once, not every run.
       - name: Cache whisper engine + model
         id: whisper-cache
         uses: actions/cache@v4

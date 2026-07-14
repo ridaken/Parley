@@ -6,7 +6,8 @@
 .DESCRIPTION
   Downloads an official whisper.cpp Windows release and a ggml model, then lays
   them out where Parley looks:
-      resources/whisper/bin/Release/whisper-server.exe  (+ DLLs)
+      resources/whisper/bin/Release/whisper-server.exe       (CPU + DLLs)
+      resources/whisper/bin/cuda/Release/whisper-server.exe  (CUDA + DLLs)
       resources/whisper/models/<model>.bin
 
   These artifacts are large and third-party, so they are NOT committed to the
@@ -25,11 +26,11 @@
   ggml-large-v3-turbo-q5_0.bin (most accurate, heavier on CPU).
 
 .PARAMETER Variant
-  Which prebuilt binary to fetch: cpu (default), blas (faster CPU), or
-  cublas-12.4.0 / cublas-11.8.0 (NVIDIA GPU).
+  Which prebuilt binary to fetch: all (default: CPU fallback plus CUDA 12.4),
+  cpu, blas (faster CPU), or cublas-12.4.0 / cublas-11.8.0 (NVIDIA GPU).
 
 .PARAMETER Version
-  whisper.cpp release tag. Default: v1.9.1.
+  whisper.cpp release tag. Default: v1.8.6.
 
 .EXAMPLE
   pwsh ./scripts/setup-whisper.ps1
@@ -39,9 +40,9 @@
 [CmdletBinding()]
 param(
     [string]$Model = "ggml-small.en-q5_1.bin",
-    [ValidateSet("cpu", "blas", "cublas-12.4.0", "cublas-11.8.0")]
-    [string]$Variant = "cpu",
-    [string]$Version = "v1.9.1"
+    [ValidateSet("all", "cpu", "blas", "cublas-12.4.0", "cublas-11.8.0")]
+    [string]$Variant = "all",
+    [string]$Version = "v1.8.6"
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,20 +50,14 @@ $ProgressPreference = "SilentlyContinue"  # faster Invoke-WebRequest
 
 # Resolve repo root (this script lives in <root>/scripts).
 $root = Split-Path -Parent $PSScriptRoot
-$binDir = Join-Path $root "resources/whisper/bin/Release"
+$cpuBinDir = Join-Path $root "resources/whisper/bin/Release"
+$cudaBinDir = Join-Path $root "resources/whisper/bin/cuda/Release"
 $modelDir = Join-Path $root "resources/whisper/models"
-New-Item -ItemType Directory -Force -Path $binDir, $modelDir | Out-Null
-
-$asset = switch ($Variant) {
-    "cpu" { "whisper-bin-x64.zip" }
-    "blas" { "whisper-blas-bin-x64.zip" }
-    default { "whisper-$Variant-bin-x64.zip" }
-}
+New-Item -ItemType Directory -Force -Path $cpuBinDir, $cudaBinDir, $modelDir | Out-Null
 # NOTE: the GitHub org is "ggml-org", but the Hugging Face model repo is hosted
 # under the original author's namespace, "ggerganov/whisper.cpp". Using ggml-org
 # on Hugging Face yields a 401 (HF returns 401, not 404, for repos that don't
 # exist), which is the classic "looks like a proxy block but is really a bad URL".
-$releaseURL = "https://github.com/ggml-org/whisper.cpp/releases/download/$Version/$asset"
 $modelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$Model"
 
 function Get-File($url, $dest) {
@@ -70,47 +65,67 @@ function Get-File($url, $dest) {
     Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -MaximumRedirection 5
 }
 
-# ---- 1. Binary ------------------------------------------------------------
-$serverExe = Join-Path $binDir "whisper-server.exe"
-if (Test-Path $serverExe) {
-    Write-Host "[1/2] whisper-server.exe already present — skipping binary." -ForegroundColor Green
-}
-else {
-    Write-Host "[1/2] Downloading whisper.cpp $Version ($Variant)…" -ForegroundColor Cyan
-    $tmp = Join-Path $env:TEMP "parley-whisper"
+function Install-WhisperVariant($selectedVariant, $destination) {
+    $asset = switch ($selectedVariant) {
+        "cpu" { "whisper-bin-x64.zip" }
+        "blas" { "whisper-blas-bin-x64.zip" }
+        default { "whisper-$selectedVariant-bin-x64.zip" }
+    }
+    $releaseURL = "https://github.com/ggml-org/whisper.cpp/releases/download/$Version/$asset"
+    $serverExe = Join-Path $destination "whisper-server.exe"
+    if (Test-Path $serverExe) {
+        Write-Host "[1/2] whisper.cpp $selectedVariant already present — skipping binary." -ForegroundColor Green
+        return
+    }
+
+    Write-Host "[1/2] Downloading whisper.cpp $Version ($selectedVariant)…" -ForegroundColor Cyan
+    $tmp = Join-Path $env:TEMP ("parley-whisper-" + $selectedVariant + "-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     $zip = Join-Path $tmp $asset
     try {
-        Get-File $releaseURL $zip
-    }
-    catch {
-        Write-Error @"
+        try {
+            Get-File $releaseURL $zip
+        }
+        catch {
+            throw @"
 Could not download $asset from GitHub.
   $releaseURL
 $($_.Exception.Message)
 
 Manual option: download that zip yourself, extract it, and copy whisper-server.exe
 and all its .dll files into:
-  $binDir
+  $destination
 "@
-        exit 1
+        }
+        Expand-Archive -Path $zip -DestinationPath $tmp -Force
+        # The zip layout varies by release; locate the server exe wherever it landed.
+        $found = Get-ChildItem -Path $tmp -Recurse -Include "whisper-server.exe", "server.exe" |
+            Select-Object -First 1
+        if (-not $found) {
+            throw "Extracted $asset but found no whisper-server.exe/server.exe."
+        }
+        New-Item -ItemType Directory -Force -Path $destination | Out-Null
+        Copy-Item $found.FullName (Join-Path $destination "whisper-server.exe") -Force
+        Get-ChildItem -Path $found.DirectoryName -Filter *.dll | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $destination $_.Name) -Force
+        }
+        Write-Host "      -> $serverExe" -ForegroundColor Green
     }
+    finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
-    Expand-Archive -Path $zip -DestinationPath $tmp -Force
-    # The zip layout varies by release; locate the server exe wherever it landed.
-    $found = Get-ChildItem -Path $tmp -Recurse -Include "whisper-server.exe", "server.exe" |
-        Select-Object -First 1
-    if (-not $found) {
-        Write-Error "Extracted $asset but found no whisper-server.exe/server.exe inside. Inspect $tmp."
-        exit 1
-    }
-    # Copy the server exe (normalising the name) plus every DLL beside it.
-    Copy-Item $found.FullName (Join-Path $binDir "whisper-server.exe") -Force
-    Get-ChildItem -Path $found.DirectoryName -Filter *.dll | ForEach-Object {
-        Copy-Item $_.FullName (Join-Path $binDir $_.Name) -Force
-    }
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "      -> $serverExe" -ForegroundColor Green
+# ---- 1. Binaries ----------------------------------------------------------
+if ($Variant -eq "all") {
+    Install-WhisperVariant "cpu" $cpuBinDir
+    Install-WhisperVariant "cublas-12.4.0" $cudaBinDir
+}
+elseif ($Variant.StartsWith("cublas-")) {
+    Install-WhisperVariant $Variant $cudaBinDir
+}
+else {
+    Install-WhisperVariant $Variant $cpuBinDir
 }
 
 # ---- 2. Model -------------------------------------------------------------

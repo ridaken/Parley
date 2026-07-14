@@ -30,8 +30,6 @@ type Client struct {
 	http    *http.Client
 }
 
-const defaultMaxTokens = 2048
-
 // NewClient builds a client. baseURL should include the API root (e.g.
 // http://127.0.0.1:8080/v1). apiKey may be empty for local servers.
 func NewClient(baseURL, apiKey, model string) *Client {
@@ -47,7 +45,6 @@ type chatRequest struct {
 	Model          string          `json:"model"`
 	Messages       []Message       `json:"messages"`
 	Temperature    float64         `json:"temperature"`
-	MaxTokens      int             `json:"max_tokens"`
 	Stream         bool            `json:"stream"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 }
@@ -65,17 +62,21 @@ type Usage struct {
 // RequestDiagnostics captures the transport details that are useful when an
 // OpenAI-compatible endpoint fails before producing a usable completion.
 type RequestDiagnostics struct {
-	Method         string `json:"method,omitempty"`
-	URL            string `json:"url,omitempty"`
-	Model          string `json:"model,omitempty"`
-	JSONMode       bool   `json:"jsonMode"`
-	ResponseFormat string `json:"responseFormat,omitempty"`
-	StatusCode     int    `json:"statusCode,omitempty"`
-	Status         string `json:"status,omitempty"`
-	ResponseBody   string `json:"responseBody,omitempty"`
-	ErrorType      string `json:"errorType,omitempty"`
-	Error          string `json:"error,omitempty"`
-	ElapsedMs      int64  `json:"elapsedMs,omitempty"`
+	Method           string `json:"method,omitempty"`
+	URL              string `json:"url,omitempty"`
+	Model            string `json:"model,omitempty"`
+	JSONMode         bool   `json:"jsonMode"`
+	ResponseFormat   string `json:"responseFormat,omitempty"`
+	StatusCode       int    `json:"statusCode,omitempty"`
+	Status           string `json:"status,omitempty"`
+	ResponseBody     string `json:"responseBody,omitempty"`
+	ErrorType        string `json:"errorType,omitempty"`
+	Error            string `json:"error,omitempty"`
+	ElapsedMs        int64  `json:"elapsedMs,omitempty"`
+	FinishReason     string `json:"finishReason,omitempty"`
+	PromptTokens     int    `json:"promptTokens,omitempty"`
+	CompletionTokens int    `json:"completionTokens,omitempty"`
+	TotalTokens      int    `json:"totalTokens,omitempty"`
 }
 
 // RequestError keeps HTTP status, body, and transport exception details intact
@@ -178,7 +179,6 @@ func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool
 		Model:       c.model,
 		Messages:    messages,
 		Temperature: 0.2,
-		MaxTokens:   defaultMaxTokens,
 		Stream:      false,
 	}
 	if jsonMode {
@@ -222,18 +222,36 @@ func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool
 	if len(out.Choices) == 0 {
 		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("empty response"))
 	}
-	if out.Usage.PromptTokens != 0 || out.Usage.CompletionTokens != 0 || out.Usage.TotalTokens != 0 {
-		log.Printf("[llm] tokens prompt=%d completion=%d total=%d",
-			out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Usage.TotalTokens)
+	choice := out.Choices[0]
+	if choice.FinishReason != "" || out.Usage.PromptTokens != 0 || out.Usage.CompletionTokens != 0 || out.Usage.TotalTokens != 0 {
+		log.Printf("[llm] finish_reason=%q tokens prompt=%d completion=%d total=%d",
+			choice.FinishReason, out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Usage.TotalTokens)
 	}
-	reply := out.Choices[0].replyText()
+	reply := choice.replyText()
+	if strings.EqualFold(choice.FinishReason, "length") {
+		return "", c.completionError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), choice, out.Usage,
+			fmt.Errorf("completion truncated (finish_reason=%s)", choice.FinishReason))
+	}
 	if strings.TrimSpace(reply) == "" {
-		if out.Choices[0].FinishReason != "" {
-			return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("empty assistant content (finish_reason=%s)", out.Choices[0].FinishReason))
+		if choice.FinishReason != "" {
+			return "", c.completionError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), choice, out.Usage,
+				fmt.Errorf("empty assistant content (finish_reason=%s)", choice.FinishReason))
 		}
 		return "", c.requestError(req, jsonMode, start, resp.StatusCode, resp.Status, string(data), fmt.Errorf("empty assistant content"))
 	}
 	return reply, nil
+}
+
+func (c *Client) completionError(req *http.Request, jsonMode bool, start time.Time, statusCode int, status, body string, choice chatChoice, usage Usage, cause error) error {
+	err := c.requestError(req, jsonMode, start, statusCode, status, body, cause)
+	var reqErr *RequestError
+	if errors.As(err, &reqErr) {
+		reqErr.diagnostics.FinishReason = choice.FinishReason
+		reqErr.diagnostics.PromptTokens = usage.PromptTokens
+		reqErr.diagnostics.CompletionTokens = usage.CompletionTokens
+		reqErr.diagnostics.TotalTokens = usage.TotalTokens
+	}
+	return err
 }
 
 func (c *Client) requestError(req *http.Request, jsonMode bool, start time.Time, statusCode int, status, body string, cause error) error {

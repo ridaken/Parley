@@ -157,9 +157,20 @@ func (m *MeetingService) start(resumeID int64) error {
 		log.Printf("[stt] using remote transcription server: %s", remote)
 		sttURL = strings.TrimRight(remote, "/")
 	} else {
-		binPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
+		cpuBinPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
 		if err != nil {
 			return m.fail("The local transcription engine isn't installed. Run \"task setup:whisper\" (or scripts/setup-whisper.ps1) to fetch it, or set a remote transcription URL in Settings.", err)
+		}
+		binPath := cpuBinPath
+		usingGPU := false
+		if gpuBinPath, gpuErr := resolveResource(filepath.Join("resources", "whisper", "bin", "cuda", "Release", "whisper-server.exe")); gpuErr == nil && stt.HasNVIDIAGPU() {
+			binPath = gpuBinPath
+			usingGPU = true
+			log.Printf("[stt] NVIDIA GPU detected; using CUDA transcription engine: %s", gpuBinPath)
+		} else if gpuErr != nil {
+			log.Printf("[stt] CUDA transcription engine is not installed; using CPU engine")
+		} else {
+			log.Printf("[stt] no available NVIDIA GPU detected; using CPU transcription engine")
 		}
 		modelName := settings.WhisperModel
 		if modelName == "" {
@@ -181,7 +192,15 @@ func (m *MeetingService) start(resumeID int64) error {
 
 		m.server = stt.NewServer(binPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
 		if err := m.server.Start(context.Background()); err != nil {
-			return m.fail("The transcription engine didn't start. See the log file for details.", err)
+			if !usingGPU {
+				return m.fail("The transcription engine didn't start. See the log file for details.", err)
+			}
+			log.Printf("[stt] CUDA transcription engine failed to start (%v); retrying with CPU engine", err)
+			m.server = stt.NewServer(cpuBinPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
+			if cpuErr := m.server.Start(context.Background()); cpuErr != nil {
+				return m.fail("Neither the GPU nor CPU transcription engine could start. See the log file for details.", fmt.Errorf("GPU: %v; CPU: %w", err, cpuErr))
+			}
+			log.Printf("[stt] CPU transcription fallback started successfully")
 		}
 		sttURL = m.server.URL()
 	}

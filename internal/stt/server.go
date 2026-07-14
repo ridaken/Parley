@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +22,20 @@ type Server struct {
 	logPath   string
 	cmd       *exec.Cmd
 	logFile   *os.File
+	done      chan error
+}
+
+// HasNVIDIAGPU reports whether Windows can see at least one working NVIDIA GPU.
+// The CUDA whisper build still gets a guarded startup attempt and CPU fallback;
+// this probe avoids launching it on machines where it cannot possibly work.
+func HasNVIDIAGPU() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	cmd := exec.Command("nvidia-smi", "-L")
+	hideWindow(cmd)
+	out, err := cmd.CombinedOutput()
+	return err == nil && strings.Contains(strings.ToLower(string(out)), "gpu ")
 }
 
 // NewServer configures (but does not start) a whisper server. If logPath is
@@ -63,6 +79,11 @@ func (s *Server) Start(ctx context.Context) error {
 		s.closeLog()
 		return fmt.Errorf("start whisper server: %w", err)
 	}
+	s.done = make(chan error, 1)
+	go func() {
+		s.done <- s.cmd.Wait()
+		close(s.done)
+	}()
 
 	return s.waitReady(ctx)
 }
@@ -75,6 +96,13 @@ func (s *Server) waitReady(ctx context.Context) error {
 		case <-ctx.Done():
 			s.Stop()
 			return ctx.Err()
+		case err := <-s.done:
+			s.cmd = nil
+			s.closeLog()
+			if err == nil {
+				return fmt.Errorf("whisper server exited before becoming ready")
+			}
+			return fmt.Errorf("whisper server exited before becoming ready: %w", err)
 		default:
 		}
 		resp, err := client.Get(s.URL() + "/")
@@ -94,9 +122,12 @@ func (s *Server) waitReady(ctx context.Context) error {
 func (s *Server) Stop() {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
-		_ = s.cmd.Wait()
+		if s.done != nil {
+			<-s.done
+		}
 		s.cmd = nil
 	}
+	s.done = nil
 	s.closeLog()
 }
 

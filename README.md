@@ -209,14 +209,15 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup-whisper.ps1
 
 # Equivalent shortcuts (only if you have the runners): task setup:whisper  /  wails3 task setup:whisper
 
-# Options (smaller/faster model, or a BLAS build):
+# Options (smaller/faster model, or a specific engine build):
 pwsh ./scripts/setup-whisper.ps1 -Model ggml-base.en.bin -Variant blas
 ```
 
 This places everything where Parley looks:
 
 ```
-resources/whisper/bin/Release/whisper-server.exe   # + required DLLs
+resources/whisper/bin/Release/whisper-server.exe        # CPU fallback + DLLs
+resources/whisper/bin/cuda/Release/whisper-server.exe   # NVIDIA CUDA + DLLs
 resources/whisper/models/ggml-small.en-q5_1.bin    # default model
 ```
 
@@ -239,6 +240,10 @@ enterprise laptop that needs to stay responsive for other work: it is quantized
 better than `base` at names, acronyms, and jargon — exactly what meetings are full
 of. whisper only works in short bursts per audio chunk, so even this leaves plenty
 of headroom. Tune in **Settings → Transcription**:
+
+On Windows, the packaged app automatically uses the CUDA engine when a working
+NVIDIA GPU is detected. If CUDA cannot start, Parley retries with the bundled CPU
+engine so transcription remains available. Other GPU backends are not yet bundled.
 
 | Model file | Size | Speed | Accuracy | When to pick it |
 |------------|------|-------|----------|-----------------|

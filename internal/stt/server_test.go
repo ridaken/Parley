@@ -40,3 +40,23 @@ func TestServerRedirectsOutputToLog(t *testing.T) {
 		t.Fatalf("expected whisper output in log file, got %d bytes", len(data))
 	}
 }
+
+func TestServerReportsChildExitWithoutWaitingForStartupTimeout(t *testing.T) {
+	model := filepath.Join(t.TempDir(), "model.bin")
+	if err := os.WriteFile(model, []byte("test"), 0o600); err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+
+	// A Go test binary exits immediately when Server supplies whisper's unknown
+	// -m/--host/--port flags. This exercises process supervision without needing
+	// a second fixture executable.
+	srv := NewServer(os.Args[0], model, "127.0.0.1", 18109, filepath.Join(t.TempDir(), "whisper.log"))
+	started := time.Now()
+	err := srv.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exited before becoming ready") {
+		t.Fatalf("expected early child-exit error, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("child exit took %v to surface; expected immediate failure", elapsed)
+	}
+}
