@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-// resolveResource locates a bundled resource (whisper binary/model) by checking
+// resolveResource locates a local transcription resource by checking
 // a few base directories: the working dir, the executable's dir, and parents of
 // the executable's dir (so it works both via `task dev` and a packaged build).
 func resolveResource(rel string) (string, error) {

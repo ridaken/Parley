@@ -5,11 +5,13 @@ output audio, mixed), transcribes it locally, and uses an LLM to surface — in 
 time — the **current topic**, **assertions** made (attributed to *You* vs *Others*),
 a history of **past topics**, and **suggested questions**.
 
-It is **local-first**: audio and transcription stay on your machine. The only
-optional outbound path is an LLM endpoint you configure (which can also be local).
+It is **local-first**: audio and transcription stay on your machine. A fresh
+NVIDIA install downloads the optional local ASR runtime/model; during meetings,
+the only optional outbound path is an LLM endpoint you configure (which can also
+be local).
 
 - **Stack:** Wails 3 (alpha) · Go backend · React + TypeScript + Tailwind/shadcn UI
-- **Transcription:** bundled `whisper.cpp` server (or a remote one you point it at)
+- **Transcription:** Nemotron 3.5 ASR Streaming on NVIDIA; bundled CPU `whisper.cpp` fallback
 - **LLM:** any OpenAI-compatible endpoint (local llama-server / LM Studio / Ollama, or cloud)
 
 ---
@@ -23,7 +25,7 @@ optional outbound path is an LLM endpoint you configure (which can also be local
 - 💬 **Live context injection** — correct or add context mid-meeting (see below).
 - 💾 **Save / load / resume meetings** — every meeting is auto-saved; reopen it to
   review, or **resume** it to keep recording (multi-part meetings).
-- 🔌 **Bring-your-own transcription** — offload STT to a remote whisper.cpp server.
+- 🔌 **Bring-your-own transcription** — offload STT to a compatible remote server.
 - 🧰 **Saved LLM connections** — store multiple providers (local + cloud) and switch
   between them per meeting from the header, without re-entering URLs/keys each time.
 
@@ -45,8 +47,8 @@ flowchart TD
     MIC -->|"16 kHz mono int16"| CH["Chunker"]
     SYS -->|"16 kHz mono int16"| CH
 
-    CH -->|"every 5 s, per source<br/>(silent windows skipped)"| WAV["Encode mono WAV"]
-    WAV -->|"POST multipart /inference"| WS["whisper.cpp server<br/>(bundled subprocess or remote URL)"]
+    CH -->|"Nemotron: 320 ms cached streams<br/>Whisper: 5 s windows"| WAV["Encode mono WAV"]
+    WAV -->|"POST multipart /inference"| WS["Local ASR server<br/>(Nemotron GPU / Whisper CPU)<br/>or remote URL"]
     WS -->|"JSON: text field"| SEG["Segment: source, text, startMs, endMs"]
 
     SEG --> UI1["Live transcript panel"]
@@ -56,15 +58,16 @@ flowchart TD
     NOTES["🗒️ Live context notes<br/>(This topic / Whole meeting)"] --> ENG
     PROFILE["📋 Meeting context profile<br/>(summary / people / notes)"] --> ENG
 
-    ENG -->|"every analysis interval<br/>(default 15 s, min 3 s)"| PROMPT["Build prompt:<br/>context + notes + last 60 lines"]
+    ENG -->|"every analysis interval<br/>(default 15 s, min 3 s)"| PROMPT["Build prompt:<br/>context + notes + pending transcript"]
     PROMPT -->|"POST /chat/completions<br/>(OpenAI-compatible)"| LLM["LLM endpoint<br/>(local or cloud)"]
     LLM -->|"minified JSON reply"| STATE["State: current topic,<br/>assertions, past topics, suggestions"]
     STATE --> UI2["Analysis panels"]
     STATE --> DB
 ```
 
-Only the **LLM** call leaves the machine (and only if you point it at a remote
-endpoint). Audio and transcription stay local.
+During a meeting, only the **LLM** call leaves the machine (and only if you point
+it at a remote endpoint). A fresh NVIDIA install also downloads the optional
+Nemotron runtime/model once. Audio and transcription stay local.
 
 ### The analysis interval
 
@@ -74,15 +77,17 @@ interval*, default **15 s**, floor **3 s**). On each tick the engine
 
 1. **Skips** the tick if the previous analysis is still in flight, or if no new
    transcript lines have arrived since the last run (no churn on a quiet meeting).
-2. Builds a prompt from the **last 60 transcript lines** (`promptWindowLines`) plus
-   the meeting context and any in-effect live notes.
+2. Builds a prompt from transcript lines that arrived since the last successful
+   analysis, plus the prior meeting state, meeting context, and in-effect live
+   notes. The retained rolling transcript is capped at 600 lines.
 3. Sends one **non-streaming** chat completion (`temperature: 0.2`) and parses the
    reply. The whole transcript buffer is capped at 600 lines, and at most 30 past
    topics are retained.
 
 A shorter interval = fresher insight but more LLM calls; a longer interval is
-cheaper and calmer. Transcription is independent of this — it always runs on its
-own 5-second cadence.
+cheaper and calmer. Transcription is independent of this: Nemotron advances
+cache-aware streams every 320 ms and publishes coalesced transcript segments at
+about one-second cadence; the CPU Whisper fallback uses independent 5-second windows.
 
 ### How topics are decided
 
@@ -103,7 +108,11 @@ dropped so a stale correction can't bleed into the next topic.
 | `response_format` | `json` |
 | `temperature` | `0.0` |
 
-Response (whisper.cpp): `{ "text": "the transcribed text" }`
+Response: `{ "text": "the transcribed text" }`
+
+The local Nemotron sidecar additionally accepts `POST /stream` with `stream_id`,
+`action=feed|finish`, and a WAV `file` for feed actions. Parley keeps one stream
+per capture source, preserving the model's encoder/decoder cache between frames.
 
 **Analysis** — `POST {llmBaseURL}/chat/completions` (OpenAI-compatible),
 `Authorization: Bearer <key>` if a key is set:
@@ -198,10 +207,26 @@ Audio capture uses miniaudio via cgo, so a C compiler must be on `PATH`:
 
 ---
 
-## Bundled transcription engine (whisper.cpp)
+## Local transcription engines
+
+On Windows, a fresh packaged install checks for an NVIDIA GPU. If one is
+available with at least 6 GiB VRAM and compute capability 7.0, the installer provisions
+[`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
+plus its private Python/CUDA runtime under `resources/nemotron/`. Only the 2.55 GB
+Transformers checkpoint is fetched; the duplicate 2.37 GB NeMo archive is excluded.
+The resulting installation is reused in place on app upgrades, so upgrades do not
+redownload the model.
+
+Nemotron is Parley's preferred NVIDIA backend. It is a 600M-parameter,
+cache-aware FastConformer-RNNT model with punctuation and capitalization. If GPU
+provisioning or model startup fails for any reason, Parley automatically uses the
+small CPU Whisper engine that is included in every installer. Provisioning failure
+does not fail the Parley install.
+
+### Developer setup
 
 The whisper binaries and model are **large and not committed** (see `.gitignore`),
-and the app does **not** auto-download them. Fetch them with the setup script:
+and development checkouts do **not** auto-download them. Fetch the CPU fallback:
 
 ```powershell
 # Run from the repo root in PowerShell. This is all `task setup:whisper` does:
@@ -209,17 +234,35 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup-whisper.ps1
 
 # Equivalent shortcuts (only if you have the runners): task setup:whisper  /  wails3 task setup:whisper
 
-# Options (smaller/faster model, or a specific engine build):
+# Options (smaller/faster model, or a developer-only engine build):
 pwsh ./scripts/setup-whisper.ps1 -Model ggml-base.en.bin -Variant blas
 ```
 
 This places everything where Parley looks:
 
 ```
-resources/whisper/bin/Release/whisper-server.exe        # CPU fallback + DLLs
-resources/whisper/bin/cuda/Release/whisper-server.exe   # NVIDIA CUDA + DLLs
-resources/whisper/models/ggml-small.en-q5_1.bin    # default model
+resources/whisper/bin/Release/whisper-server.exe     # CPU fallback + DLLs
+resources/whisper/models/ggml-small.en-q5_1.bin       # default CPU model
 ```
+
+To exercise the packaged NVIDIA path from a checkout, run the same idempotent
+provisioner the installer uses (expect several GB of downloads):
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File ./resources/nemotron/setup.ps1
+# Equivalent: task setup:nemotron / wails3 task setup:nemotron
+```
+
+That script downloads a private Python 3.11 runtime with `uv`, CUDA PyTorch,
+Transformers 5.13+, and the model checkpoint. It writes
+`resources/nemotron/.ready` only after CUDA and the local model configuration
+validate successfully.
+
+Parley uses Nemotron's default 320 ms native streaming mode and keeps independent
+cache state for the microphone and system-audio sources. Transformers' RNNT
+generation mutates temporary decoder state, so the sidecar loads two FP16 model
+instances rather than unsafely sharing one instance across simultaneous streams.
+Token deltas are coalesced into transcript rows at roughly one-second cadence.
 
 If a corporate proxy blocks the download (Hugging Face / GitHub), the script prints
 the exact URL and target path so you can drop the files in manually — or skip the
@@ -232,18 +275,17 @@ bundled engine and set a **remote transcription URL** in Settings (see below).
 > author's Hugging Face namespace `ggerganov` — pointing at `ggml-org` on Hugging
 > Face returns a misleading **401**, since HF answers 401 for repos that don't exist.)
 
-### Choosing a model (CPU-friendly)
+### Choosing a Whisper fallback model
 
 The default — **`ggml-small.en-q5_1.bin`** (~182 MB) — is chosen for a capable
 enterprise laptop that needs to stay responsive for other work: it is quantized
 (low RAM/CPU), transcribes a 5-second chunk in well under a second, and is markedly
 better than `base` at names, acronyms, and jargon — exactly what meetings are full
-of. whisper only works in short bursts per audio chunk, so even this leaves plenty
+of. Whisper only works in short bursts per audio chunk, so even this leaves plenty
 of headroom. Tune in **Settings → Transcription**:
 
-On Windows, the packaged app automatically uses the CUDA engine when a working
-NVIDIA GPU is detected. If CUDA cannot start, Parley retries with the bundled CPU
-engine so transcription remains available. Other GPU backends are not yet bundled.
+This setting controls only the CPU fallback; a ready Nemotron installation takes
+precedence on NVIDIA systems.
 
 | Model file | Size | Speed | Accuracy | When to pick it |
 |------------|------|-------|----------|-----------------|
@@ -259,7 +301,7 @@ it to the script: `pwsh ./scripts/setup-whisper.ps1 -Model ggml-large-v3-turbo-q
 
 ### Or: use a remote transcription server
 
-If you'd rather not transcribe on this machine, run a `whisper.cpp` server elsewhere
+If you'd rather not transcribe on this machine, run a compatible server elsewhere
 and set **Settings → Transcription → Remote transcription URL** (e.g.
 `http://192.168.1.10:8765`). When set, Parley skips the bundled engine entirely.
 
@@ -286,8 +328,10 @@ task package    # no Task? → wails3 task package
 > console window appears). Prefer `task …` or `wails3 task …` over a bare
 > `wails3 build` so those flags are applied — or install Task (see Prerequisites).
 
-When packaging, make sure the `resources/whisper/` folder ships **next to the
-executable** (Parley searches the working dir and the exe's directory + parents).
+When packaging, make sure `resources/` ships **next to the executable** (Parley
+searches the working dir and the exe's directory + parents). Release CI embeds the
+CPU Whisper payload and the small Nemotron provisioner files; it does not embed the
+Nemotron model or Python/CUDA runtime.
 
 ---
 
@@ -342,6 +386,11 @@ Audio is recorded per source under your app-data `recordings/session-<id>/` fold
   and writes full details to **`parley.log`** in your app-data folder (Windows:
   `%AppData%\Parley\`). For a packaged build, the `resources/whisper/` folder must sit
   next to the `.exe`.
+- **Nemotron was not selected on an NVIDIA system.** Check
+  `%AppData%\Parley\nemotron-server.log`. Parley requires a complete
+  `resources\nemotron` installation with a `.ready` marker and falls back to CPU
+  Whisper when the model cannot load. Re-run `resources\nemotron\setup.ps1` to
+  resume an interrupted first-install download; it reuses files already present.
 - **"No mic" with a mic selected.** The badge now reflects whether a microphone source
   actually started. If it still says *No mic*, that device failed to open (wrong device,
   in use, or unsupported format) — check `parley.log` and try another device.
@@ -392,4 +441,4 @@ Audio is recorded per source under your app-data `recordings/session-<id>/` fold
 
 See `docs/PLAN.md` for phase status and `docs/POLISH-BACKLOG.md` for deferred polish.
 Next up: cross-platform bundled-engine launcher (macOS/Linux), session full-text search
-and export, whisper model picker with on-demand download, and GPU acceleration.
+and export, and richer language/model controls for transcription.

@@ -46,8 +46,8 @@ type Settings struct {
 	ActiveProfileID     int64           `json:"activeProfileID"`
 	HasAPIKey           bool            `json:"hasAPIKey"`
 	CaptureSources      []CaptureSource `json:"captureSources"`
-	// SttBaseURL, when set, points transcription at a remote whisper.cpp-compatible
-	// server (e.g. http://host:8765) instead of launching the bundled engine.
+	// SttBaseURL, when set, points transcription at a remote /inference-compatible
+	// server (e.g. http://host:8765) instead of launching a local engine.
 	SttBaseURL string `json:"sttBaseURL"`
 	// WhisperModel is the model filename under resources/whisper/models used by the
 	// bundled engine. Defaults to ggml-small.en-q5_1.bin (quantized; accurate but

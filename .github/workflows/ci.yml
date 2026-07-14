@@ -60,14 +60,12 @@ jobs:
       # `npm run build` runs `tsc` (typecheck) then `vite build` (production bundle).
       - run: npm run build
 
-  # Builds the Windows NSIS installer and publishes it to a rolling "latest"
-  # prerelease. Runs only after the gates above pass, and only on a real merge to
-  # main (not on PRs). The published Parley-Setup.exe both installs fresh and
-  # updates an existing installation in place.
+  # Builds the Windows NSIS installer on PRs as well as main so packaging changes
+  # are compiled before merge. Only a real push to main publishes the rolling
+  # release. The published installer handles both fresh installs and upgrades.
   installer:
     name: Windows installer
     needs: [go, frontend]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     permissions:
       contents: write
@@ -106,18 +104,19 @@ jobs:
           choco install nsis -y
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      # The CPU/CUDA whisper engines + model are gitignored and large; cache them
-      # keyed on the fetch script so they download once, not every run.
+      # The CPU whisper engine + small model are gitignored and large; cache them
+      # keyed on the fetch script so they download once, not every run. Nemotron
+      # is provisioned only by fresh installs on machines with NVIDIA GPUs.
       - name: Cache whisper engine + model
         id: whisper-cache
         uses: actions/cache@v4
         with:
           path: resources/whisper
-          key: whisper-${{ hashFiles('scripts/setup-whisper.ps1') }}
+          key: whisper-cpu-${{ hashFiles('scripts/setup-whisper.ps1') }}
 
       - name: Fetch whisper engine + model
         if: steps.whisper-cache.outputs.cache-hit != 'true'
-        run: wails3 task setup:whisper
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup-whisper.ps1 -Variant cpu
 
       # Version = config.yml major.minor + CI run number, e.g. 0.1.42. Unique and
       # increasing per merge; shown in Add/Remove Programs and used for updates.
@@ -140,6 +139,7 @@ jobs:
       # time so the download URL stays stable:
       #   .../releases/download/latest/Parley-Setup.exe
       - name: Publish to rolling latest release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

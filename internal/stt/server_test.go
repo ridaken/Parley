@@ -60,3 +60,24 @@ func TestServerReportsChildExitWithoutWaitingForStartupTimeout(t *testing.T) {
 		t.Fatalf("child exit took %v to surface; expected immediate failure", elapsed)
 	}
 }
+
+func TestCommandServerReportsNamedChildExit(t *testing.T) {
+	srv := NewCommandServer(
+		"Nemotron test",
+		os.Args[0],
+		[]string{"-definitely-not-a-go-test-flag"},
+		[]string{os.Args[0]},
+		"127.0.0.1",
+		18119,
+		filepath.Join(t.TempDir(), "nemotron.log"),
+		30*time.Second,
+	)
+	started := time.Now()
+	err := srv.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Nemotron test server exited before becoming ready") {
+		t.Fatalf("expected named early child-exit error, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("child exit took %v to surface; expected immediate failure", elapsed)
+	}
+}

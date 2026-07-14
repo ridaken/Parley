@@ -7,7 +7,6 @@
   Downloads an official whisper.cpp Windows release and a ggml model, then lays
   them out where Parley looks:
       resources/whisper/bin/Release/whisper-server.exe       (CPU + DLLs)
-      resources/whisper/bin/cuda/Release/whisper-server.exe  (CUDA + DLLs)
       resources/whisper/models/<model>.bin
 
   These artifacts are large and third-party, so they are NOT committed to the
@@ -26,8 +25,8 @@
   ggml-large-v3-turbo-q5_0.bin (most accurate, heavier on CPU).
 
 .PARAMETER Variant
-  Which prebuilt binary to fetch: all (default: CPU fallback plus CUDA 12.4),
-  cpu, blas (faster CPU), or cublas-12.4.0 / cublas-11.8.0 (NVIDIA GPU).
+  Which prebuilt binary to fetch: cpu (default, and the installer payload), all,
+  blas (faster CPU), or cublas-12.4.0 / cublas-11.8.0 (developer options).
 
 .PARAMETER Version
   whisper.cpp release tag. Default: v1.8.6.
@@ -41,7 +40,7 @@
 param(
     [string]$Model = "ggml-small.en-q5_1.bin",
     [ValidateSet("all", "cpu", "blas", "cublas-12.4.0", "cublas-11.8.0")]
-    [string]$Variant = "all",
+    [string]$Variant = "cpu",
     [string]$Version = "v1.8.6"
 )
 

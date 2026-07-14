@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Client posts audio to a whisper.cpp server's /inference endpoint.
+// Client posts audio to a compatible transcription server's /inference endpoint.
 type Client struct {
 	baseURL string
 	http    *http.Client
@@ -29,23 +29,52 @@ type inferenceResponse struct {
 
 // Transcribe sends a WAV payload and returns the recognised text (trimmed).
 func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
+	return c.postMultipart(ctx, "/inference", map[string]string{
+		"response_format": "json",
+		"temperature":     "0.0",
+	}, wav, true)
+}
+
+// StreamFeed advances one persistent cache-aware ASR stream and returns any new
+// text the model has emitted. streamID is normally the stable audio source label.
+func (c *Client) StreamFeed(ctx context.Context, streamID string, wav []byte) (string, error) {
+	return c.postMultipart(ctx, "/stream", map[string]string{
+		"stream_id": streamID,
+		"action":    "feed",
+	}, wav, false)
+}
+
+// StreamFinish flushes and closes a persistent ASR stream.
+func (c *Client) StreamFinish(ctx context.Context, streamID string) (string, error) {
+	return c.postMultipart(ctx, "/stream", map[string]string{
+		"stream_id": streamID,
+		"action":    "finish",
+	}, nil, false)
+}
+
+func (c *Client) postMultipart(ctx context.Context, endpoint string, fields map[string]string, wav []byte, trim bool) (string, error) {
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 
-	fw, err := w.CreateFormFile("file", "chunk.wav")
-	if err != nil {
-		return "", err
+	if wav != nil {
+		fw, err := w.CreateFormFile("file", "chunk.wav")
+		if err != nil {
+			return "", err
+		}
+		if _, err := fw.Write(wav); err != nil {
+			return "", err
+		}
 	}
-	if _, err := fw.Write(wav); err != nil {
-		return "", err
+	for name, value := range fields {
+		if err := w.WriteField(name, value); err != nil {
+			return "", err
+		}
 	}
-	_ = w.WriteField("response_format", "json")
-	_ = w.WriteField("temperature", "0.0")
 	if err := w.Close(); err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/inference", &body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+endpoint, &body)
 	if err != nil {
 		return "", err
 	}
@@ -62,13 +91,19 @@ func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("whisper inference: status %d: %s", resp.StatusCode, string(data))
+		return "", fmt.Errorf("transcription request %s: status %d: %s", endpoint, resp.StatusCode, string(data))
 	}
 
 	var out inferenceResponse
 	if err := json.Unmarshal(data, &out); err != nil {
 		// Some builds return raw text; fall back to that.
-		return strings.TrimSpace(string(data)), nil
+		if trim {
+			return strings.TrimSpace(string(data)), nil
+		}
+		return string(data), nil
 	}
-	return strings.TrimSpace(out.Text), nil
+	if trim {
+		return strings.TrimSpace(out.Text), nil
+	}
+	return out.Text, nil
 }

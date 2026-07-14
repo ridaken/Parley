@@ -80,8 +80,12 @@ OutFile "..\..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the i
 !endif
 ShowInstDetails show # This will always show the installation details.
 
+Var IsUpgrade
+
 Function .onInit
    !insertmacro wails.checkArchitecture
+
+   StrCpy $IsUpgrade "0"
 
    # On update, honor the location of a previously installed copy (recorded below
    # as InstallLocation) so we overwrite it in place instead of installing a
@@ -94,6 +98,7 @@ Function .onInit
    !endif
    ${If} $0 != ""
        StrCpy $INSTDIR $0
+       StrCpy $IsUpgrade "1"
    ${EndIf}
 FunctionEnd
 
@@ -111,12 +116,34 @@ Section
 
     !insertmacro wails.files
 
-    # Bundle the whisper transcription engine + model so the installed app is standalone.
+    # Bundle the CPU whisper transcription engine + model so every installation
+    # remains standalone. Replace shipped Whisper artifacts on upgrade, but do
+    # not remove resources/nemotron: that optional multi-GB install is persistent.
     # resolveResource() in paths.go looks for resources/ next to the exe at runtime.
-    # Remove the previous copy first so stale/renamed engine or model files don't
-    # accumulate across updates (resources/ holds only shipped artifacts).
-    RMDir /r "$INSTDIR\resources"
+    RMDir /r "$INSTDIR\resources\whisper"
     File /r "..\..\..\resources"
+
+    # On a fresh NVIDIA installation, provision Nemotron from its upstream
+    # repositories. This is deliberately non-fatal: an offline machine, an old
+    # driver, or a failed model download leaves bundled CPU Whisper available.
+    # Upgrades reuse the existing runtime/model and never redownload it.
+    ${If} $IsUpgrade == "0"
+        nsExec::ExecToStack 'cmd /C nvidia-smi -L'
+        Pop $1
+        Pop $2
+        ${If} $1 == 0
+            DetailPrint "NVIDIA GPU detected; provisioning Nemotron 3.5 ASR Streaming..."
+            nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\nemotron\setup.ps1" -InstallRoot "$INSTDIR\resources\nemotron"'
+            Pop $1
+            ${If} $1 != 0
+                DetailPrint "Nemotron provisioning did not complete (exit $1). Parley will use bundled CPU Whisper."
+            ${EndIf}
+        ${Else}
+            DetailPrint "No NVIDIA GPU detected; using bundled CPU Whisper."
+        ${EndIf}
+    ${Else}
+        DetailPrint "Upgrade detected; preserving the existing Nemotron installation."
+    ${EndIf}
 
     SetOutPath $INSTDIR
 

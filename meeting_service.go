@@ -24,10 +24,18 @@ import (
 )
 
 const (
-	whisperHost = "127.0.0.1"
-	whisperPort = 8765
-	chunkWindow = 5 * time.Second
+	whisperHost       = "127.0.0.1"
+	whisperPort       = 8765
+	chunkWindow       = 5 * time.Second
+	streamChunkWindow = 320 * time.Millisecond
 )
+
+type transcriptChunker interface {
+	Feed(audio.Source, []int16)
+	Start()
+	Stop()
+	StopWithTimeout(time.Duration)
+}
 
 // StatusEvent is broadcast whenever the capture/transcription state changes.
 type StatusEvent struct {
@@ -92,7 +100,7 @@ type MeetingService struct {
 	mu       sync.Mutex
 	running  bool
 	capturer *audio.Capturer
-	chunker  *stt.Chunker
+	chunker  transcriptChunker
 	server   *stt.Server
 	engine   *analysis.Engine
 
@@ -150,63 +158,74 @@ func (m *MeetingService) start(resumeID int64) error {
 
 	settings, _ := m.store.GetSettings()
 
-	// Transcription endpoint: a configured remote whisper server, or the bundled
-	// local engine launched as a subprocess.
+	// Transcription endpoint: a configured compatible server, or a supervised
+	// local engine. NVIDIA systems prefer the optional Nemotron installation;
+	// bundled CPU Whisper remains the always-available fallback.
 	var sttURL string
+	streamingSTT := false
 	if remote := strings.TrimSpace(settings.SttBaseURL); remote != "" {
 		log.Printf("[stt] using remote transcription server: %s", remote)
 		sttURL = strings.TrimRight(remote, "/")
 	} else {
-		cpuBinPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
-		if err != nil {
-			return m.fail("The local transcription engine isn't installed. Run \"task setup:whisper\" (or scripts/setup-whisper.ps1) to fetch it, or set a remote transcription URL in Settings.", err)
-		}
-		binPath := cpuBinPath
-		usingGPU := false
-		if gpuBinPath, gpuErr := resolveResource(filepath.Join("resources", "whisper", "bin", "cuda", "Release", "whisper-server.exe")); gpuErr == nil && stt.HasNVIDIAGPU() {
-			binPath = gpuBinPath
-			usingGPU = true
-			log.Printf("[stt] NVIDIA GPU detected; using CUDA transcription engine: %s", gpuBinPath)
-		} else if gpuErr != nil {
-			log.Printf("[stt] CUDA transcription engine is not installed; using CPU engine")
-		} else {
-			log.Printf("[stt] no available NVIDIA GPU detected; using CPU transcription engine")
-		}
-		modelName := settings.WhisperModel
-		if modelName == "" {
-			modelName = "ggml-small.en-q5_1.bin"
-		}
-		modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
-		if err != nil {
-			// The configured filename isn't present — commonly because the default
-			// model changed but a stale name is still saved in Settings, or a
-			// differently-named file was downloaded. Rather than hard-fail, fall
-			// back to whatever model IS installed so the app keeps working.
-			if alt, altName, ok := anyInstalledModel(); ok {
-				log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
-				modelPath = alt
+		var nemotronErr error
+		if stt.HasNVIDIAGPU() {
+			if nemotron, err := newNemotronServer(); err != nil {
+				nemotronErr = err
+				log.Printf("[stt] NVIDIA GPU detected but Nemotron 3.5 ASR is not provisioned: %v", err)
+			} else if err := nemotron.Start(context.Background()); err != nil {
+				nemotronErr = err
+				log.Printf("[stt] Nemotron 3.5 ASR failed to start (%v); using CPU Whisper fallback", err)
 			} else {
-				return m.fail(fmt.Sprintf("Transcription model %q is missing and no model is installed under resources/whisper/models. Run scripts/setup-whisper.ps1 to fetch one, pick another in Settings, or use a remote URL.", modelName), err)
+				m.server = nemotron
+				sttURL = nemotron.URL()
+				streamingSTT = true
+				log.Printf("[stt] using Nemotron 3.5 ASR Streaming on NVIDIA GPU")
 			}
+		} else {
+			log.Printf("[stt] no available NVIDIA GPU detected; using CPU Whisper")
 		}
 
-		m.server = stt.NewServer(binPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
-		if err := m.server.Start(context.Background()); err != nil {
-			if !usingGPU {
-				return m.fail("The transcription engine didn't start. See the log file for details.", err)
+		if sttURL == "" {
+			cpuBinPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
+			if err != nil {
+				return m.fail("The local transcription engine isn't installed. Run \"task setup:whisper\" (or scripts/setup-whisper.ps1) to fetch it, or set a remote transcription URL in Settings.", err)
 			}
-			log.Printf("[stt] CUDA transcription engine failed to start (%v); retrying with CPU engine", err)
+			modelName := settings.WhisperModel
+			if modelName == "" {
+				modelName = "ggml-small.en-q5_1.bin"
+			}
+			modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
+			if err != nil {
+				// The configured filename isn't present — commonly because the default
+				// model changed but a stale name is still saved in Settings, or a
+				// differently-named file was downloaded. Rather than hard-fail, fall
+				// back to whatever model IS installed so the app keeps working.
+				if alt, altName, ok := anyInstalledModel(); ok {
+					log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
+					modelPath = alt
+				} else {
+					return m.fail(fmt.Sprintf("Transcription model %q is missing and no model is installed under resources/whisper/models. Run scripts/setup-whisper.ps1 to fetch one, pick another in Settings, or use a remote URL.", modelName), err)
+				}
+			}
+
 			m.server = stt.NewServer(cpuBinPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
-			if cpuErr := m.server.Start(context.Background()); cpuErr != nil {
-				return m.fail("Neither the GPU nor CPU transcription engine could start. See the log file for details.", fmt.Errorf("GPU: %v; CPU: %w", err, cpuErr))
+			if err := m.server.Start(context.Background()); err != nil {
+				if nemotronErr != nil {
+					return m.fail("Neither Nemotron nor the CPU transcription fallback could start. See the transcription logs for details.", fmt.Errorf("Nemotron: %v; CPU Whisper: %w", nemotronErr, err))
+				}
+				return m.fail("The CPU transcription engine didn't start. See whisper-server.log for details.", err)
 			}
-			log.Printf("[stt] CPU transcription fallback started successfully")
+			log.Printf("[stt] using bundled CPU Whisper fallback")
+			sttURL = m.server.URL()
 		}
-		sttURL = m.server.URL()
 	}
 
 	client := stt.NewClient(sttURL)
-	m.chunker = stt.NewChunker(client, chunkWindow, m.onSegment)
+	if streamingSTT {
+		m.chunker = stt.NewStreamingChunker(client, streamChunkWindow, m.onSegment)
+	} else {
+		m.chunker = stt.NewChunker(client, chunkWindow, m.onSegment)
+	}
 	m.chunker.Start()
 
 	m.openSession(resumeID)
@@ -240,12 +259,53 @@ func (m *MeetingService) start(resumeID int64) error {
 	return nil
 }
 
-// stopServer stops the local whisper subprocess if one was launched.
+// stopServer stops the local transcription subprocess if one was launched.
 func (m *MeetingService) stopServer() {
 	if m.server != nil {
 		m.server.Stop()
 		m.server = nil
 	}
+}
+
+// newNemotronServer resolves the optional install written by resources/nemotron/setup.ps1.
+// The .ready marker is deliberately required so an interrupted installer download
+// is never mistaken for a usable model installation.
+func newNemotronServer() (*stt.Server, error) {
+	ready, err := resolveResource(filepath.Join("resources", "nemotron", ".ready"))
+	if err != nil {
+		return nil, err
+	}
+	python, err := resolveResource(filepath.Join("resources", "nemotron", "runtime", "Scripts", "python.exe"))
+	if err != nil {
+		return nil, err
+	}
+	script, err := resolveResource(filepath.Join("resources", "nemotron", "server.py"))
+	if err != nil {
+		return nil, err
+	}
+	modelDir, err := resolveResource(filepath.Join("resources", "nemotron", "model"))
+	if err != nil {
+		return nil, err
+	}
+	config := filepath.Join(modelDir, "config.json")
+	weights := filepath.Join(modelDir, "model.safetensors")
+	args := []string{
+		script,
+		"--model", modelDir,
+		"--host", whisperHost,
+		"--port", fmt.Sprintf("%d", whisperPort),
+		"--language", "en-US",
+	}
+	return stt.NewCommandServer(
+		"Nemotron 3.5 ASR",
+		python,
+		args,
+		[]string{ready, python, script, config, weights},
+		whisperHost,
+		whisperPort,
+		filepath.Join(dataDir(), "nemotron-server.log"),
+		3*time.Minute,
+	), nil
 }
 
 // anyInstalledModel returns the first *.bin model present under

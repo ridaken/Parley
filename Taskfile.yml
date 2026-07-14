@@ -40,6 +40,11 @@ tasks:
     cmds:
       - pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup-whisper.ps1 {{.CLI_ARGS}}
 
+  setup:nemotron:
+    summary: Provisions the optional NVIDIA Nemotron 3.5 ASR runtime and model
+    cmds:
+      - pwsh -NoProfile -ExecutionPolicy Bypass -File ./resources/nemotron/setup.ps1 {{.CLI_ARGS}}
+
   setup:docker:
     summary: Builds Docker image for cross-compilation (~800MB download)
     cmds:
