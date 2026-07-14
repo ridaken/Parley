@@ -2,12 +2,31 @@ package stt
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestServerDoesNotStartWithCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	srv := NewCommandServer(
+		"canceled test",
+		filepath.Join(t.TempDir(), "missing.exe"),
+		nil,
+		nil,
+		"127.0.0.1",
+		18129,
+		"",
+		time.Minute,
+	)
+	if err := srv.Start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want context.Canceled before file/process work", err)
+	}
+}
 
 // TestServerRedirectsOutputToLog verifies the whisper server starts headlessly
 // and its stdout/stderr land in the log file (never a console). Skips if the

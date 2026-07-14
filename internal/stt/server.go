@@ -80,6 +80,9 @@ func (s *Server) URL() string {
 
 // Start spawns the subprocess and blocks until it answers HTTP or ctx is done.
 func (s *Server) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, path := range s.requiredPaths {
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("%s required file not found at %s: %w", s.name, path, err)
