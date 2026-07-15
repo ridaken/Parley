@@ -11,5 +11,6 @@ export {
 export type {
     AnalysisStatusEvent,
     LoadedSession,
+    RuntimeInfo,
     StatusEvent
 } from "./models.js";

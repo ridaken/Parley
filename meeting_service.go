@@ -47,6 +47,16 @@ type localEngineResult struct {
 	server    managedSTTServer
 	streaming bool
 	name      string
+	model     string
+}
+
+// RuntimeInfo is the build and transcription metadata currently in use. The
+// frontend displays it persistently so packaged-version or model-selection
+// problems can be identified without opening log files.
+type RuntimeInfo struct {
+	AppVersion          string `json:"appVersion"`
+	TranscriptionModel  string `json:"transcriptionModel"`
+	TranscriptionStatus string `json:"transcriptionStatus"` // loading | ready | error
 }
 
 // StatusEvent is broadcast whenever the capture/transcription state changes.
@@ -127,7 +137,7 @@ type MeetingService struct {
 
 	hasNVIDIAGPU  func() bool
 	newNemotron   func() (managedSTTServer, error)
-	newCPUWhisper func(store.Settings) (managedSTTServer, error)
+	newCPUWhisper func(store.Settings) (managedSTTServer, string, error)
 
 	sessionID     atomic.Int64 // active session row; 0 when not persisting
 	lastSessionID atomic.Int64 // most recent persisted session, retained after Stop for export
@@ -154,7 +164,7 @@ func NewMeetingService(s *store.Store) *MeetingService {
 		hasNVIDIAGPU: stt.HasNVIDIAGPU,
 	}
 	m.newNemotron = func() (managedSTTServer, error) { return newNemotronServer() }
-	m.newCPUWhisper = func(settings store.Settings) (managedSTTServer, error) {
+	m.newCPUWhisper = func(settings store.Settings) (managedSTTServer, string, error) {
 		return newCPUWhisperServer(settings)
 	}
 	return m
@@ -187,6 +197,51 @@ func (m *MeetingService) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.running
+}
+
+// GetRuntimeInfo reports the exact app version and the transcription model that
+// has actually been selected. In particular, this reflects a CPU fallback when
+// Nemotron was preferred but could not start, rather than merely echoing the
+// configured model filename.
+func (m *MeetingService) GetRuntimeInfo() RuntimeInfo {
+	info := RuntimeInfo{AppVersion: appVersion, TranscriptionStatus: "loading"}
+	if m.store != nil {
+		settings, err := m.store.GetSettings()
+		if err != nil {
+			info.TranscriptionModel = "Unavailable"
+			info.TranscriptionStatus = "error"
+			return info
+		}
+		if remote := strings.TrimSpace(settings.SttBaseURL); remote != "" {
+			info.TranscriptionModel = "Remote model · " + strings.TrimRight(remote, "/")
+			info.TranscriptionStatus = "ready"
+			return info
+		}
+	}
+
+	m.localMu.Lock()
+	done := m.localDone
+	result := m.localResult
+	loadErr := m.localErr
+	m.localMu.Unlock()
+
+	if done == nil {
+		info.TranscriptionModel = "Preparing local model…"
+		return info
+	}
+	select {
+	case <-done:
+		if loadErr != nil || result.server == nil {
+			info.TranscriptionModel = "Local model unavailable"
+			info.TranscriptionStatus = "error"
+			return info
+		}
+		info.TranscriptionModel = result.model
+		info.TranscriptionStatus = "ready"
+	default:
+		info.TranscriptionModel = "Loading local model…"
+	}
+	return info
 }
 
 // Start launches a fresh meeting using the app's preloaded transcription engine,
@@ -306,10 +361,10 @@ func newNemotronServer() (*stt.Server, error) {
 }
 
 // newCPUWhisperServer resolves the bundled fallback without starting it.
-func newCPUWhisperServer(settings store.Settings) (*stt.Server, error) {
+func newCPUWhisperServer(settings store.Settings) (*stt.Server, string, error) {
 	cpuBinPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
 	if err != nil {
-		return nil, fmt.Errorf("resolve bundled whisper server: %w", err)
+		return nil, "", fmt.Errorf("resolve bundled whisper server: %w", err)
 	}
 	modelName := settings.WhisperModel
 	if modelName == "" {
@@ -324,11 +379,12 @@ func newCPUWhisperServer(settings store.Settings) (*stt.Server, error) {
 		if alt, altName, ok := anyInstalledModel(); ok {
 			log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
 			modelPath = alt
+			modelName = altName
 		} else {
-			return nil, fmt.Errorf("transcription model %q is missing and no fallback model is installed: %w", modelName, err)
+			return nil, "", fmt.Errorf("transcription model %q is missing and no fallback model is installed: %w", modelName, err)
 		}
 	}
-	return stt.NewServer(cpuBinPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log")), nil
+	return stt.NewServer(cpuBinPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log")), modelName, nil
 }
 
 // beginLocalEngine starts one app-lifetime preparation attempt and returns the
@@ -356,6 +412,7 @@ func (m *MeetingService) beginLocalEngine(parent context.Context, settings store
 		m.localCancel = nil
 		close(done)
 		m.localMu.Unlock()
+		emitRuntimeInfo(m.GetRuntimeInfo())
 	}()
 	return done
 }
@@ -376,7 +433,12 @@ func (m *MeetingService) loadLocalEngine(ctx context.Context, settings store.Set
 			log.Printf("[stt] Nemotron 3.5 ASR failed to preload (%v); preparing CPU Whisper fallback", err)
 		} else {
 			log.Printf("[stt] Nemotron 3.5 ASR Streaming preloaded on NVIDIA GPU")
-			return localEngineResult{server: nemotron, streaming: true, name: "Nemotron 3.5 ASR Streaming"}, nil
+			return localEngineResult{
+				server:    nemotron,
+				streaming: true,
+				name:      "Nemotron 3.5 ASR Streaming",
+				model:     "NVIDIA Nemotron 3.5 ASR Streaming 0.6B · GPU",
+			}, nil
 		}
 	} else {
 		log.Printf("[stt] no available NVIDIA GPU detected; preloading CPU Whisper")
@@ -385,7 +447,7 @@ func (m *MeetingService) loadLocalEngine(ctx context.Context, settings store.Set
 		return localEngineResult{}, err
 	}
 
-	whisper, err := m.newCPUWhisper(settings)
+	whisper, modelName, err := m.newCPUWhisper(settings)
 	if err == nil {
 		err = whisper.Start(ctx)
 	}
@@ -399,7 +461,11 @@ func (m *MeetingService) loadLocalEngine(ctx context.Context, settings store.Set
 		return localEngineResult{}, fmt.Errorf("CPU Whisper: %w", err)
 	}
 	log.Printf("[stt] bundled CPU Whisper fallback preloaded")
-	return localEngineResult{server: whisper, name: "bundled CPU Whisper"}, nil
+	return localEngineResult{
+		server: whisper,
+		name:   "bundled CPU Whisper",
+		model:  "Whisper " + modelName + " · CPU",
+	}, nil
 }
 
 func (m *MeetingService) waitLocalEngine(ctx context.Context, settings store.Settings) (localEngineResult, error) {
@@ -881,6 +947,12 @@ func emitListening(active []audio.Source, hasMic bool) {
 func emitAnalysisStatus(state, message string) {
 	if app := application.Get(); app != nil {
 		app.Event.Emit("analysisStatus", AnalysisStatusEvent{State: state, Message: message})
+	}
+}
+
+func emitRuntimeInfo(info RuntimeInfo) {
+	if app := application.Get(); app != nil {
+		app.Event.Emit("runtimeInfo", info)
 	}
 }
 

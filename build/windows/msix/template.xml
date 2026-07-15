@@ -17,7 +17,7 @@
         PackageDisplayName="Parley"
         PublisherName="CN=Vokac"
         PublisherDisplayName="Vokac"
-        Version="0.1.0.0"
+        Version="0.1.1.0"
         PackageDescription="Local-first meeting assistant">
         <Capabilities>
             <Capability Name="runFullTrust" />

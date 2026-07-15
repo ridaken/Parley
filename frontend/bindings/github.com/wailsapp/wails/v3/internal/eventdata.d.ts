@@ -20,6 +20,7 @@ declare module "@wailsio/runtime" {
         interface CustomEvents {
             "analysis": analysis$0.State;
             "analysisStatus": main$0.AnalysisStatusEvent;
+            "runtimeInfo": main$0.RuntimeInfo;
             "status": main$0.StatusEvent;
             "transcript": stt$0.Segment;
         }

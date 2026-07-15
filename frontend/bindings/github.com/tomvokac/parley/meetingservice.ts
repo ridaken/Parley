@@ -46,6 +46,16 @@ export function ExportMarkdown(sessionID: number): $CancellablePromise<string> {
 }
 
 /**
+ * GetRuntimeInfo reports the exact app version and the transcription model that
+ * has actually been selected. In particular, this reflects a CPU fallback when
+ * Nemotron was preferred but could not start, rather than merely echoing the
+ * configured model filename.
+ */
+export function GetRuntimeInfo(): $CancellablePromise<$models.RuntimeInfo> {
+    return $Call.ByID(3989995776);
+}
+
+/**
  * IsRunning reports whether a session is active.
  */
 export function IsRunning(): $CancellablePromise<boolean> {

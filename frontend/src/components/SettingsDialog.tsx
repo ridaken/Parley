@@ -381,13 +381,14 @@ export function SettingsDialog({
                   onChange={(e) => setSettings({ ...settings, sttBaseURL: e.target.value })}
                 />
                 <p className="text-[11px] leading-snug text-muted-foreground">
-                  Blank = transcribe locally with the bundled Whisper model (private,
-                  no setup). Set this to a whisper.cpp server URL (e.g.
+                  Blank = transcribe locally (private, no setup), using Nemotron on a
+                  supported NVIDIA GPU or the bundled CPU Whisper fallback. Set this
+                  to a compatible server URL (e.g.
                   http://192.168.1.10:8765) to offload transcription to another machine.
                 </p>
               </div>
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="whispermodel">Bundled model file</Label>
+                <Label htmlFor="whispermodel">Bundled CPU fallback model</Label>
                 <Input
                   id="whispermodel"
                   value={settings.whisperModel}
