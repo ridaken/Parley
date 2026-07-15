@@ -1,14 +1,20 @@
-name: CI
+name: CI and Release
 
 on:
   push:
     branches: [main]
   pull_request:
 
-# Scope: the pure-Go packages (store, analysis, llm, condense) plus the frontend
-# build. The cgo packages (audio, stt) and the root package need a C compiler and
-# the Wails toolchain; those are exercised by the maintainer's `wails3 build` and
-# are intentionally out of scope here so CI stays fast and hermetic.
+# A newer commit on the same PR or on main supersedes older work. In particular,
+# a merge to main cancels any in-flight test, build, or release for the previous
+# main commit and starts this run immediately.
+concurrency:
+  group: ci-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   go:
     name: Go tests
@@ -53,25 +59,18 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      # `npm install` (not `npm ci`) tolerates the committed lock file lagging
-      # behind package.json's resolved tree (e.g. platform-specific transitive
-      # deps); this job verifies the typecheck/build, not lock-file reproducibility.
+
+      # npm install is intentional until the existing package.json/package-lock.json
+      # drift is resolved; the production build below still typechecks the app.
       - run: npm install --no-audit --no-fund
-      # `npm run build` runs `tsc` (typecheck) then `vite build` (production bundle).
       - run: npm run build
 
-  # Builds the Windows NSIS installer on PRs as well as main so packaging changes
-  # are compiled before merge. Only a real push to main publishes the rolling
-  # release. The published installer handles both fresh installs and upgrades.
   installer:
     name: Windows installer
     needs: [go, frontend]
     runs-on: windows-latest
     permissions:
       contents: write
-    concurrency:
-      group: installer-release
-      cancel-in-progress: false
     defaults:
       run:
         shell: pwsh
@@ -87,11 +86,11 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      # CGO is required (github.com/gen2brain/malgo). windows-latest ships MinGW;
-      # install it only if gcc is somehow absent.
       - name: Ensure C compiler
         run: |
-          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) { choco install mingw -y }
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw -y
+          }
           gcc --version
 
       - name: Install Wails CLI
@@ -118,37 +117,59 @@ jobs:
         if: steps.whisper-cache.outputs.cache-hit != 'true'
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup-whisper.ps1 -Variant cpu
 
-      # Version = config.yml major.minor + CI run number, e.g. 0.1.42. Unique and
-      # increasing per merge; shown in Add/Remove Programs and used for updates.
-      - name: Compute version
-        id: ver
+      # Use the highest completed semantic release (not a workflow run number or
+      # draft left by a cancelled run), then increment its patch component. The
+      # configured app version is the minimum version baseline.
+      - name: Compute next version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          $cfg = Get-Content build/config.yml -Raw
-          if ($cfg -match 'version:\s*"([0-9]+)\.([0-9]+)') { $major = $matches[1]; $minor = $matches[2] }
-          else { $major = '0'; $minor = '1' }
-          $version = "$major.$minor.${{ github.run_number }}"
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Installer version: $version"
+          $config = Get-Content build/config.yml -Raw
+          if ($config -notmatch '(?m)^\s+version:\s*["'']?([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw 'build/config.yml must contain an info.version in major.minor.patch format'
+          }
+
+          $baseline = [version]$matches[1]
+          $highest = $baseline
+          if ($env:EVENT_NAME -eq 'push') {
+            $releases = gh release list --limit 1000 --exclude-drafts --json tagName | ConvertFrom-Json
+            foreach ($release in $releases) {
+              if ($release.tagName -match '^v?([0-9]+\.[0-9]+\.[0-9]+)$') {
+                $candidate = [version]$matches[1]
+                if ($candidate -gt $highest) { $highest = $candidate }
+              }
+            }
+          }
+
+          # PRs build the baseline version as a packaging gate but never publish.
+          # Main increments the latest completed release.
+          if ($env:EVENT_NAME -eq 'push') {
+            $next = [version]::new($highest.Major, $highest.Minor, $highest.Build + 1)
+          } else {
+            $next = $baseline
+          }
+          "number=$next" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=v$next" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Next release: v$next"
 
       - name: Build installer
         run: |
-          wails3 task windows:package INSTALL_SCOPE=user PRODUCT_VERSION=${{ steps.ver.outputs.version }}
-          Copy-Item bin/Parley-amd64-installer.exe bin/Parley-Setup.exe -Force
+          wails3 task windows:package INSTALL_SCOPE=user PRODUCT_VERSION=${{ steps.version.outputs.number }}
+          Copy-Item bin/Parley-amd64-installer.exe "bin/Parley-Setup-${{ steps.version.outputs.tag }}.exe" -Force
 
-      # Publish to a single rolling "latest" prerelease, replacing the asset each
-      # time so the download URL stays stable:
-      #   .../releases/download/latest/Parley-Setup.exe
-      - name: Publish to rolling latest release
+      # gh creates the release as a draft, uploads the asset, and only then
+      # publishes it. This keeps a partially uploaded installer from becoming the
+      # latest public release if GitHub cancels the run during this command.
+      - name: Publish GitHub release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "latest"
-          $notes = "Automated build ${{ steps.ver.outputs.version }} - commit $env:GITHUB_SHA"
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --prerelease --title "Latest build" --notes $notes --target $env:GITHUB_SHA
-          } else {
-            gh release edit $tag --notes $notes --target $env:GITHUB_SHA
-          }
-          gh release upload $tag bin/Parley-Setup.exe --clobber
+          gh release create "${{ steps.version.outputs.tag }}" `
+            "bin/Parley-Setup-${{ steps.version.outputs.tag }}.exe#Parley Windows installer" `
+            --target "$env:GITHUB_SHA" `
+            --title "Parley ${{ steps.version.outputs.number }}" `
+            --generate-notes `
+            --latest
