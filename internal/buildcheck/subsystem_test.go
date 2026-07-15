@@ -36,7 +36,11 @@ func TestInstallerOffersMissingNemotronOnUpgrade(t *testing.T) {
 	}
 	installer := string(data)
 	for _, required := range []string{
+		`taskkill /T /F /IM "${PRODUCT_EXECUTABLE}"`,
 		`IfFileExists "$INSTDIR\resources\nemotron\.ready"`,
+		`StrCpy $NemotronRoot "$LOCALAPPDATA\Parley\nemotron"`,
+		`IfFileExists "$NemotronRoot\.source-root"`,
+		`-DiscoverExisting -ReuseOnly`,
 		`StrCmp $IsUpgrade "0" nemotron_provision`,
 		`MessageBox MB_YESNO|MB_ICONQUESTION`,
 		`IfSilent nemotron_silent_skip`,
@@ -49,5 +53,27 @@ func TestInstallerOffersMissingNemotronOnUpgrade(t *testing.T) {
 	}
 	if strings.Contains(installer, "cmd /C nvidia-smi") {
 		t.Fatalf("%s probes nvidia-smi through 32-bit cmd; WOW64 redirection hides the System32 executable", path)
+	}
+	if strings.Contains(installer, `File /r "..\..\..\resources"`) {
+		t.Fatalf("%s recursively bundles all generated Nemotron assets from a developer checkout", path)
+	}
+}
+
+func TestNemotronSetupUsesPrivatePythonAndSharedStorage(t *testing.T) {
+	path := filepath.Join("..", "..", "resources", "nemotron", "setup.ps1")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	setup := string(data)
+	for _, required := range []string{
+		`Join-Path $env:LOCALAPPDATA "Parley/nemotron"`,
+		`Invoke-Checked $uvExe python install 3.11 --no-bin`,
+		`Test-CompleteNemotronInstall`,
+		`Write-SourceRoot`,
+	} {
+		if !strings.Contains(setup, required) {
+			t.Fatalf("%s no longer contains %q", path, required)
+		}
 	}
 }
