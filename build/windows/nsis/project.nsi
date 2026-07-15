@@ -131,7 +131,12 @@ Section
     IfFileExists "$INSTDIR\resources\nemotron\.ready" nemotron_present nemotron_probe_gpu
 
     nemotron_probe_gpu:
-        nsExec::ExecToStack 'cmd /C nvidia-smi -L'
+        # NSIS is a 32-bit process even for an amd64 installer. Without disabling
+        # filesystem redirection, System32 resolves to SysWOW64, where NVIDIA's
+        # 64-bit nvidia-smi.exe is not installed.
+        ${DisableX64FSRedirection}
+        nsExec::ExecToStack '"$SYSDIR\nvidia-smi.exe" -L'
+        ${EnableX64FSRedirection}
         Pop $1
         Pop $2
         StrCmp $1 "0" nemotron_gpu_found nemotron_no_gpu
@@ -143,7 +148,11 @@ Section
 
     nemotron_provision:
         DetailPrint "NVIDIA GPU detected; provisioning Nemotron 3.5 ASR Streaming..."
+        # Launch 64-bit PowerShell so setup.ps1 can also resolve nvidia-smi and
+        # validate VRAM/compute capability without WOW64 redirection.
+        ${DisableX64FSRedirection}
         nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\nemotron\setup.ps1" -InstallRoot "$INSTDIR\resources\nemotron"'
+        ${EnableX64FSRedirection}
         Pop $1
         StrCmp $1 "0" 0 nemotron_provision_failed
         IfFileExists "$INSTDIR\resources\nemotron\.ready" nemotron_provisioned nemotron_not_ready
