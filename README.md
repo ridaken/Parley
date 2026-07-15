@@ -286,14 +286,20 @@ precedence on NVIDIA systems.
 
 `large-v3-turbo` is the modern speed/quality sweet spot at the top end (≈8× faster
 decoding than `large-v3`); pick it if accuracy matters more than leaving the CPU idle.
-Drop the file in `resources/whisper/models/` and set its filename in Settings, or pass
-it to the script: `pwsh ./scripts/setup-whisper.ps1 -Model ggml-large-v3-turbo-q5_0.bin`.
+Drop the file in `resources/whisper/models/`; Parley discovers installed `.bin` files
+and lists each one under **Settings → Transcription → Model**. You can also pass it to
+the setup script: `pwsh ./scripts/setup-whisper.ps1 -Model ggml-large-v3-turbo-q5_0.bin`.
 
 ### Or: use a remote transcription server
 
-If you'd rather not transcribe on this machine, run a compatible server elsewhere
-and set **Settings → Transcription → Remote transcription URL** (e.g.
-`http://192.168.1.10:8765`). When set, Parley skips the bundled engine entirely.
+If you'd rather not transcribe on this machine, run a compatible server elsewhere,
+select **Settings → Transcription → Model → External server**, and enter its URL
+(e.g. `http://192.168.1.10:8765`). Parley can test reachability but does not manage
+the remote process. When selected, it skips local model loading entirely.
+
+The same section lists Automatic, installed Nemotron, and every installed Whisper
+model. Local selections can be started, stopped to release memory, or restarted while
+no meeting is active. Starting a meeting automatically reloads a stopped local model.
 
 > ⚠️ **Platform note:** the bundled-engine path is currently hard-coded to the Windows
 > layout (`bin/Release/whisper-server.exe`). On macOS/Linux, use the **remote URL**
@@ -335,7 +341,7 @@ Nemotron model or Python/CUDA runtime.
 3. **Settings** (gear icon): save one **LLM connection** per provider (name, base
    URL, model, optional API key) — a local llama-server / LM Studio / Ollama, or a
    cloud URL. Mark one **active** (★), **Test** each, and set the analysis interval
-   and transcription options. Switch which connection a meeting uses from the
+   and choose/manage the transcription model. Switch which LLM connection a meeting uses from the
    **LLM connection dropdown in the header** (before you start the meeting).
 4. **Start listening.** The transcript streams on the left; the current topic strip
    and the discussion outline / assertions / action items / suggested questions
@@ -377,14 +383,15 @@ pre-meeting context followed by every timestamped transcript line.
 
 - **"The local transcription engine isn't installed" on Start.** You haven't fetched
   the whisper engine yet — run **`task setup:whisper`** (or `scripts/setup-whisper.ps1`),
-  or set a remote transcription URL in Settings. Parley shows the reason in a red banner
+  or select an External server in Settings. Parley shows the reason in a red banner
   and writes full details to **`parley.log`** in your app-data folder (Windows:
   `%AppData%\Parley\`). For a packaged build, the `resources/whisper/` folder must sit
   next to the `.exe`.
-- **Nemotron was not selected on an NVIDIA system.** Check
+- **Automatic did not select Nemotron on an NVIDIA system.** Check
   `%AppData%\Parley\nemotron-server.log`. Parley requires a complete
   `resources\nemotron` installation with a `.ready` marker and falls back to CPU
-  Whisper when the model cannot load. Re-run `resources\nemotron\setup.ps1` to
+  Whisper when the model cannot load. An explicitly selected Nemotron reports the
+  failure instead of silently switching models. Re-run `resources\nemotron\setup.ps1` to
   resume an interrupted first-install download; it reuses files already present.
 - **"No mic" with a mic selected.** The badge now reflects whether a microphone source
   actually started. If it still says *No mic*, that device failed to open (wrong device,

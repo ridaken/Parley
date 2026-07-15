@@ -3,6 +3,7 @@ import { Events } from "@wailsio/runtime";
 import {
   AlertTriangle,
   AudioLines,
+  CheckCircle2,
   Download,
   History,
   Loader2,
@@ -152,7 +153,10 @@ function App() {
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo>({
     appVersion: "",
     transcriptionModel: "Loading local model…",
+    transcriptionModelID: "auto",
+    transcriptionKind: "local",
     transcriptionStatus: "loading",
+    transcriptionMessage: "Loading the selected transcription model…",
   });
   // Session-scoped suggestion pins/dismissals, keyed by normalized text. The
   // `analysis` listener is registered once, so it reads these via refs to avoid a
@@ -265,6 +269,7 @@ function App() {
           ...info,
           transcriptionModel: "Model status unavailable",
           transcriptionStatus: "error",
+          transcriptionMessage: "Parley could not read the transcription model status.",
         }))
       );
 
@@ -708,10 +713,19 @@ function App() {
         </span>
         <span
           className="flex min-w-0 items-center gap-1.5"
-          title={`Voice-to-text model: ${runtimeInfo.transcriptionModel}`}
+          title={`Voice-to-text model: ${runtimeInfo.transcriptionModel}${runtimeInfo.transcriptionMessage ? ` — ${runtimeInfo.transcriptionMessage}` : ""}`}
         >
           {runtimeInfo.transcriptionStatus === "loading" && (
             <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+          )}
+          {(runtimeInfo.transcriptionStatus === "ready" || runtimeInfo.transcriptionStatus === "configured") && (
+            <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-400" />
+          )}
+          {runtimeInfo.transcriptionStatus === "error" && (
+            <AlertTriangle className="h-3 w-3 shrink-0 text-destructive" />
+          )}
+          {runtimeInfo.transcriptionStatus === "stopped" && (
+            <Square className="h-2.5 w-2.5 shrink-0" />
           )}
           <span className="shrink-0">Voice-to-text:</span>
           <span className="truncate text-foreground/75">
@@ -721,7 +735,12 @@ function App() {
       </footer>
 
       <AudioDialog open={audioOpen} onOpenChange={setAudioOpen} />
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <SettingsDialog
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        meetingActive={active}
+        runtimeInfo={runtimeInfo}
+      />
       <ContextDialog open={contextOpen} onOpenChange={setContextOpen} />
       <SessionsDialog
         open={sessionsOpen}

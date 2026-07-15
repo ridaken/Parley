@@ -42,11 +42,18 @@ export interface LoadedSession {
 export interface RuntimeInfo {
     "appVersion": string;
     "transcriptionModel": string;
+    "transcriptionModelID": string;
 
     /**
-     * loading | ready | error
+     * local | external
+     */
+    "transcriptionKind": string;
+
+    /**
+     * stopped | loading | ready | configured | error
      */
     "transcriptionStatus": string;
+    "transcriptionMessage": string;
 }
 
 /**
@@ -60,4 +67,29 @@ export interface StatusEvent {
     "message": string;
     "micAvailable": boolean;
     "activeSources": string[] | null;
+}
+
+/**
+ * TranscriptionConfig is the user-facing selection saved by the model manager.
+ * ModelID is one of auto, nemotron, whisper:<filename>, or external.
+ */
+export interface TranscriptionConfig {
+    "modelID": string;
+    "externalURL": string;
+}
+
+/**
+ * TranscriptionModelOption describes one selectable transcription provider.
+ */
+export interface TranscriptionModelOption {
+    "id": string;
+    "label": string;
+
+    /**
+     * automatic | local | external
+     */
+    "kind": string;
+    "detail": string;
+    "available": boolean;
+    "unavailableReason": string;
 }

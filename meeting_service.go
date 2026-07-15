@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,13 +54,33 @@ type localEngineResult struct {
 	model     string
 }
 
+// TranscriptionConfig is the user-facing selection saved by the model manager.
+// ModelID is one of auto, nemotron, whisper:<filename>, or external.
+type TranscriptionConfig struct {
+	ModelID     string `json:"modelID"`
+	ExternalURL string `json:"externalURL"`
+}
+
+// TranscriptionModelOption describes one selectable transcription provider.
+type TranscriptionModelOption struct {
+	ID                string `json:"id"`
+	Label             string `json:"label"`
+	Kind              string `json:"kind"` // automatic | local | external
+	Detail            string `json:"detail"`
+	Available         bool   `json:"available"`
+	UnavailableReason string `json:"unavailableReason"`
+}
+
 // RuntimeInfo is the build and transcription metadata currently in use. The
 // frontend displays it persistently so packaged-version or model-selection
 // problems can be identified without opening log files.
 type RuntimeInfo struct {
-	AppVersion          string `json:"appVersion"`
-	TranscriptionModel  string `json:"transcriptionModel"`
-	TranscriptionStatus string `json:"transcriptionStatus"` // loading | ready | error
+	AppVersion           string `json:"appVersion"`
+	TranscriptionModel   string `json:"transcriptionModel"`
+	TranscriptionModelID string `json:"transcriptionModelID"`
+	TranscriptionKind    string `json:"transcriptionKind"`   // local | external
+	TranscriptionStatus  string `json:"transcriptionStatus"` // stopped | loading | ready | configured | error
+	TranscriptionMessage string `json:"transcriptionMessage"`
 }
 
 // StatusEvent is broadcast whenever the capture/transcription state changes.
@@ -134,10 +158,13 @@ type MeetingService struct {
 	localCancel context.CancelFunc
 	localResult localEngineResult
 	localErr    error
+	localState  string
+	localKey    string
+	localGen    uint64
 
 	hasNVIDIAGPU  func() bool
 	newNemotron   func() (managedSTTServer, error)
-	newCPUWhisper func(store.Settings) (managedSTTServer, string, error)
+	newCPUWhisper func(store.Settings, bool) (managedSTTServer, string, error)
 
 	sessionID     atomic.Int64 // active session row; 0 when not persisting
 	lastSessionID atomic.Int64 // most recent persisted session, retained after Stop for export
@@ -164,8 +191,8 @@ func NewMeetingService(s *store.Store) *MeetingService {
 		hasNVIDIAGPU: stt.HasNVIDIAGPU,
 	}
 	m.newNemotron = func() (managedSTTServer, error) { return newNemotronServer() }
-	m.newCPUWhisper = func(settings store.Settings) (managedSTTServer, string, error) {
-		return newCPUWhisperServer(settings)
+	m.newCPUWhisper = func(settings store.Settings, allowFallback bool) (managedSTTServer, string, error) {
+		return newCPUWhisperServer(settings, allowFallback)
 	}
 	return m
 }
@@ -179,7 +206,7 @@ func (m *MeetingService) ServiceStartup(ctx context.Context, _ application.Servi
 		log.Printf("[stt] could not read settings for startup preload: %v", err)
 		return nil
 	}
-	if strings.TrimSpace(settings.SttBaseURL) != "" {
+	if settings.SttEngine == "external" {
 		log.Printf("[stt] remote transcription configured; skipping local model preload")
 		return nil
 	}
@@ -204,42 +231,55 @@ func (m *MeetingService) IsRunning() bool {
 // Nemotron was preferred but could not start, rather than merely echoing the
 // configured model filename.
 func (m *MeetingService) GetRuntimeInfo() RuntimeInfo {
-	info := RuntimeInfo{AppVersion: appVersion, TranscriptionStatus: "loading"}
+	info := RuntimeInfo{AppVersion: appVersion, TranscriptionKind: "local", TranscriptionStatus: "stopped"}
+	var settings store.Settings
 	if m.store != nil {
-		settings, err := m.store.GetSettings()
+		var err error
+		settings, err = m.store.GetSettings()
 		if err != nil {
 			info.TranscriptionModel = "Unavailable"
 			info.TranscriptionStatus = "error"
+			info.TranscriptionMessage = "Could not read transcription settings."
 			return info
 		}
-		if remote := strings.TrimSpace(settings.SttBaseURL); remote != "" {
-			info.TranscriptionModel = "Remote model · " + strings.TrimRight(remote, "/")
-			info.TranscriptionStatus = "ready"
+		info.TranscriptionModelID = transcriptionModelID(settings)
+		if settings.SttEngine == "external" {
+			remote := strings.TrimRight(strings.TrimSpace(settings.SttBaseURL), "/")
+			info.TranscriptionKind = "external"
+			info.TranscriptionModel = "External · " + remote
+			info.TranscriptionStatus = "configured"
+			info.TranscriptionMessage = "Parley does not manage the external server process."
 			return info
 		}
 	}
 
 	m.localMu.Lock()
-	done := m.localDone
 	result := m.localResult
 	loadErr := m.localErr
+	state := m.localState
 	m.localMu.Unlock()
 
-	if done == nil {
-		info.TranscriptionModel = "Preparing local model…"
-		return info
+	if info.TranscriptionModelID == "" {
+		info.TranscriptionModelID = "auto"
 	}
-	select {
-	case <-done:
-		if loadErr != nil || result.server == nil {
-			info.TranscriptionModel = "Local model unavailable"
-			info.TranscriptionStatus = "error"
-			return info
-		}
+	info.TranscriptionModel = configuredTranscriptionLabel(settings)
+	switch state {
+	case "loading":
+		info.TranscriptionStatus = "loading"
+		info.TranscriptionMessage = "Loading the selected transcription model…"
+	case "ready":
 		info.TranscriptionModel = result.model
 		info.TranscriptionStatus = "ready"
+		info.TranscriptionMessage = "Ready for transcription."
+	case "error":
+		info.TranscriptionStatus = "error"
+		info.TranscriptionMessage = "The selected model could not start."
+		if loadErr != nil {
+			info.TranscriptionMessage = loadErr.Error()
+		}
 	default:
-		info.TranscriptionModel = "Loading local model…"
+		info.TranscriptionStatus = "stopped"
+		info.TranscriptionMessage = "The selected local model is stopped."
 	}
 	return info
 }
@@ -264,12 +304,16 @@ func (m *MeetingService) start(resumeID int64) error {
 
 	settings, _ := m.store.GetSettings()
 
-	// Transcription endpoint: a configured compatible server, or a supervised
-	// local engine. NVIDIA systems prefer the optional Nemotron installation;
-	// bundled CPU Whisper remains the always-available fallback.
+	// Transcription endpoint: the explicitly configured remote server or a
+	// supervised local engine. Automatic local selection retains the original
+	// Nemotron-first, Whisper-fallback behavior.
 	var sttURL string
 	streamingSTT := false
-	if remote := strings.TrimSpace(settings.SttBaseURL); remote != "" {
+	if settings.SttEngine == "external" {
+		remote := strings.TrimSpace(settings.SttBaseURL)
+		if remote == "" {
+			return m.fail("The external transcription URL is empty. Choose a local model or configure the server URL in Settings.", errors.New("external transcription URL is empty"))
+		}
 		log.Printf("[stt] using remote transcription server: %s", remote)
 		sttURL = strings.TrimRight(remote, "/")
 	} else {
@@ -361,7 +405,7 @@ func newNemotronServer() (*stt.Server, error) {
 }
 
 // newCPUWhisperServer resolves the bundled fallback without starting it.
-func newCPUWhisperServer(settings store.Settings) (*stt.Server, string, error) {
+func newCPUWhisperServer(settings store.Settings, allowFallback bool) (*stt.Server, string, error) {
 	cpuBinPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve bundled whisper server: %w", err)
@@ -371,7 +415,7 @@ func newCPUWhisperServer(settings store.Settings) (*stt.Server, string, error) {
 		modelName = "ggml-small.en-q5_1.bin"
 	}
 	modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
-	if err != nil {
+	if err != nil && allowFallback {
 		// The configured filename isn't present — commonly because the default
 		// model changed but a stale name is still saved in Settings, or a
 		// differently-named file was downloaded. Rather than hard-fail, fall back
@@ -380,36 +424,60 @@ func newCPUWhisperServer(settings store.Settings) (*stt.Server, string, error) {
 			log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
 			modelPath = alt
 			modelName = altName
+			err = nil
 		} else {
 			return nil, "", fmt.Errorf("transcription model %q is missing and no fallback model is installed: %w", modelName, err)
 		}
 	}
+	if err != nil {
+		return nil, "", fmt.Errorf("transcription model %q is missing: %w", modelName, err)
+	}
 	return stt.NewServer(cpuBinPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log")), modelName, nil
 }
 
-// beginLocalEngine starts one app-lifetime preparation attempt and returns the
-// channel closed when either Nemotron or the CPU fallback is ready (or both have
-// failed). Every caller observes the same result, preventing duplicate model
-// loads when Start is clicked while startup preparation is still running.
+// beginLocalEngine starts (or joins) a preparation attempt for the configured
+// local model. A generation token prevents a canceled load from publishing a
+// stale process after Stop, Restart, or a model change.
 func (m *MeetingService) beginLocalEngine(parent context.Context, settings store.Settings) <-chan struct{} {
+	key := localEngineKey(settings)
 	m.localMu.Lock()
-	if m.localDone != nil {
+	if m.localDone != nil && m.localKey == key && (m.localState == "loading" || m.localState == "ready") {
 		done := m.localDone
 		m.localMu.Unlock()
 		return done
 	}
+	m.localGen++
+	generation := m.localGen
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	m.localDone = done
 	m.localCancel = cancel
+	m.localResult = localEngineResult{}
+	m.localErr = nil
+	m.localState = "loading"
+	m.localKey = key
 	m.localMu.Unlock()
+	emitRuntimeInfo(m.GetRuntimeInfo())
 
 	go func() {
 		result, err := m.loadLocalEngine(ctx, settings)
 		m.localMu.Lock()
+		if generation != m.localGen {
+			m.localMu.Unlock()
+			if result.server != nil {
+				result.server.Stop()
+			}
+			close(done)
+			return
+		}
 		m.localResult = result
 		m.localErr = err
 		m.localCancel = nil
+		if err != nil || result.server == nil {
+			m.localState = "error"
+		} else {
+			m.localState = "ready"
+		}
 		close(done)
 		m.localMu.Unlock()
 		emitRuntimeInfo(m.GetRuntimeInfo())
@@ -418,6 +486,43 @@ func (m *MeetingService) beginLocalEngine(parent context.Context, settings store
 }
 
 func (m *MeetingService) loadLocalEngine(ctx context.Context, settings store.Settings) (localEngineResult, error) {
+	switch settings.SttEngine {
+	case "nemotron":
+		if !m.hasNVIDIAGPU() {
+			return localEngineResult{}, errors.New("Nemotron requires a working NVIDIA GPU")
+		}
+		nemotron, err := m.newNemotron()
+		if err != nil {
+			return localEngineResult{}, fmt.Errorf("Nemotron is not fully installed: %w", err)
+		}
+		if err := nemotron.Start(ctx); err != nil {
+			nemotron.Stop()
+			return localEngineResult{}, fmt.Errorf("Nemotron: %w", err)
+		}
+		return localEngineResult{
+			server: nemotron, streaming: true, name: "Nemotron 3.5 ASR Streaming",
+			model: "NVIDIA Nemotron 3.5 ASR Streaming 0.6B · GPU",
+		}, nil
+	case "whisper":
+		whisper, modelName, err := m.newCPUWhisper(settings, false)
+		if err == nil {
+			err = whisper.Start(ctx)
+		}
+		if err != nil {
+			if whisper != nil {
+				whisper.Stop()
+			}
+			return localEngineResult{}, fmt.Errorf("Whisper %s: %w", settings.WhisperModel, err)
+		}
+		return localEngineResult{
+			server: whisper, name: "bundled CPU Whisper", model: "Whisper " + modelName + " · CPU",
+		}, nil
+	case "auto", "":
+		// Continue below with the original Nemotron-first fallback behavior.
+	default:
+		return localEngineResult{}, fmt.Errorf("unsupported transcription engine %q", settings.SttEngine)
+	}
+
 	var nemotronErr error
 	if m.hasNVIDIAGPU() {
 		nemotron, err := m.newNemotron()
@@ -447,7 +552,7 @@ func (m *MeetingService) loadLocalEngine(ctx context.Context, settings store.Set
 		return localEngineResult{}, err
 	}
 
-	whisper, modelName, err := m.newCPUWhisper(settings)
+	whisper, modelName, err := m.newCPUWhisper(settings, true)
 	if err == nil {
 		err = whisper.Start(ctx)
 	}
@@ -477,15 +582,25 @@ func (m *MeetingService) waitLocalEngine(ctx context.Context, settings store.Set
 	}
 	m.localMu.Lock()
 	defer m.localMu.Unlock()
+	if m.localKey != localEngineKey(settings) {
+		return localEngineResult{}, errors.New("transcription model changed while it was loading")
+	}
 	return m.localResult, m.localErr
 }
 
-// shutdownLocalEngine cancels an in-progress preload, waits for its goroutine,
-// and releases a successfully prepared app-lifetime server.
+// shutdownLocalEngine invalidates the current generation, then cancels/waits
+// without holding localMu so the loader can finish cleanup without deadlocking.
 func (m *MeetingService) shutdownLocalEngine() {
 	m.localMu.Lock()
+	m.localGen++
 	cancel := m.localCancel
 	done := m.localDone
+	server := m.localResult.server
+	m.localDone = nil
+	m.localCancel = nil
+	m.localResult = localEngineResult{}
+	m.localErr = nil
+	m.localState = "stopped"
 	m.localMu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -494,13 +609,325 @@ func (m *MeetingService) shutdownLocalEngine() {
 		<-done
 	}
 
-	m.localMu.Lock()
-	server := m.localResult.server
-	m.localResult = localEngineResult{}
-	m.localMu.Unlock()
 	if server != nil {
 		server.Stop()
 	}
+	emitRuntimeInfo(m.GetRuntimeInfo())
+}
+
+func localEngineKey(settings store.Settings) string {
+	return settings.SttEngine + "\x00" + settings.WhisperModel
+}
+
+func transcriptionModelID(settings store.Settings) string {
+	switch settings.SttEngine {
+	case "nemotron", "external":
+		return settings.SttEngine
+	case "whisper":
+		return "whisper:" + settings.WhisperModel
+	default:
+		return "auto"
+	}
+}
+
+func configuredTranscriptionLabel(settings store.Settings) string {
+	switch settings.SttEngine {
+	case "nemotron":
+		return "NVIDIA Nemotron 3.5 ASR Streaming 0.6B · GPU"
+	case "whisper":
+		return "Whisper " + settings.WhisperModel + " · CPU"
+	case "external":
+		return "External · " + strings.TrimRight(strings.TrimSpace(settings.SttBaseURL), "/")
+	default:
+		return "Automatic local model"
+	}
+}
+
+// ListTranscriptionModels discovers the selectable local installations and the
+// always-available external-server choice.
+func (m *MeetingService) ListTranscriptionModels() ([]TranscriptionModelOption, error) {
+	whisperModels, _ := installedWhisperModels()
+	_, whisperBinErr := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
+	nemotronReason := nemotronUnavailableReason(m.hasNVIDIAGPU())
+	nemotronAvailable := nemotronReason == ""
+	whisperAvailable := whisperBinErr == nil && len(whisperModels) > 0
+
+	auto := TranscriptionModelOption{
+		ID: "auto", Label: "Automatic (recommended)", Kind: "automatic",
+		Detail:    "Use Nemotron on a supported NVIDIA GPU, then fall back to installed CPU Whisper.",
+		Available: nemotronAvailable || whisperAvailable,
+	}
+	if !auto.Available {
+		auto.UnavailableReason = "No usable local Nemotron or Whisper installation was found."
+	}
+	options := []TranscriptionModelOption{auto, {
+		ID: "nemotron", Label: "Nemotron 3.5 ASR Streaming", Kind: "local",
+		Detail: "Low-latency NVIDIA GPU transcription.", Available: nemotronAvailable,
+		UnavailableReason: nemotronReason,
+	}}
+	for _, name := range whisperModels {
+		option := TranscriptionModelOption{
+			ID: "whisper:" + name, Label: "Whisper · " + name, Kind: "local",
+			Detail: "Bundled whisper.cpp CPU transcription.", Available: whisperBinErr == nil,
+		}
+		if whisperBinErr != nil {
+			option.UnavailableReason = "The bundled whisper.cpp server is not installed."
+		}
+		options = append(options, option)
+	}
+
+	var settings store.Settings
+	var err error
+	if m.store != nil {
+		settings, err = m.store.GetSettings()
+	}
+	if err == nil && settings.SttEngine == "whisper" {
+		selectedID := transcriptionModelID(settings)
+		found := false
+		for _, option := range options {
+			if option.ID == selectedID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			options = append(options, TranscriptionModelOption{
+				ID: selectedID, Label: "Missing Whisper model · " + settings.WhisperModel,
+				Kind: "local", Detail: "This previously selected model is no longer installed.",
+				UnavailableReason: "The model file could not be found.",
+			})
+		}
+	}
+	options = append(options, TranscriptionModelOption{
+		ID: "external", Label: "External server", Kind: "external", Available: true,
+		Detail: "Use an HTTP server with a whisper.cpp-compatible /inference endpoint.",
+	})
+	return options, nil
+}
+
+// ConfigureTranscription validates and persists a model selection, then
+// reconciles the idle runtime. Local loading continues asynchronously.
+func (m *MeetingService) ConfigureTranscription(config TranscriptionConfig) error {
+	current, err := m.store.GetSettings()
+	if err != nil {
+		return err
+	}
+	next, err := settingsForTranscriptionConfig(current, config)
+	if err != nil {
+		return err
+	}
+	unchanged := current.SttEngine == next.SttEngine && current.WhisperModel == next.WhisperModel && strings.TrimSpace(current.SttBaseURL) == strings.TrimSpace(next.SttBaseURL)
+	if unchanged {
+		return nil
+	}
+	if err := m.ensureTranscriptionIdle(); err != nil {
+		return err
+	}
+	if err := m.validateTranscriptionSettings(next); err != nil {
+		return err
+	}
+	if err := m.store.SaveTranscriptionSettings(next.SttEngine, next.SttBaseURL, next.WhisperModel); err != nil {
+		return err
+	}
+	m.shutdownLocalEngine()
+	if next.SttEngine != "external" {
+		m.beginLocalEngine(context.Background(), next)
+	} else {
+		emitRuntimeInfo(m.GetRuntimeInfo())
+	}
+	return nil
+}
+
+// StartTranscriptionModel loads the selected local model without starting a meeting.
+func (m *MeetingService) StartTranscriptionModel() error {
+	if err := m.ensureTranscriptionIdle(); err != nil {
+		return err
+	}
+	settings, err := m.store.GetSettings()
+	if err != nil {
+		return err
+	}
+	if settings.SttEngine == "external" {
+		return errors.New("external server processes cannot be started by Parley; use Test connection instead")
+	}
+	if err := m.validateTranscriptionSettings(settings); err != nil {
+		return err
+	}
+	m.beginLocalEngine(context.Background(), settings)
+	return nil
+}
+
+// StopTranscriptionModel releases the selected local model while Parley is idle.
+func (m *MeetingService) StopTranscriptionModel() error {
+	if err := m.ensureTranscriptionIdle(); err != nil {
+		return err
+	}
+	settings, err := m.store.GetSettings()
+	if err != nil {
+		return err
+	}
+	if settings.SttEngine == "external" {
+		return errors.New("external server processes cannot be stopped by Parley")
+	}
+	m.shutdownLocalEngine()
+	return nil
+}
+
+// RestartTranscriptionModel replaces the current local process with a fresh load.
+func (m *MeetingService) RestartTranscriptionModel() error {
+	if err := m.ensureTranscriptionIdle(); err != nil {
+		return err
+	}
+	settings, err := m.store.GetSettings()
+	if err != nil {
+		return err
+	}
+	if settings.SttEngine == "external" {
+		return errors.New("external server processes cannot be restarted by Parley")
+	}
+	if err := m.validateTranscriptionSettings(settings); err != nil {
+		return err
+	}
+	m.shutdownLocalEngine()
+	m.beginLocalEngine(context.Background(), settings)
+	return nil
+}
+
+// TestExternalTranscription verifies that an external HTTP server is reachable.
+// Any HTTP response counts as reachable; the inference path is exercised by the
+// first real transcription request.
+func (m *MeetingService) TestExternalTranscription(baseURL string) error {
+	clean, err := normalizeExternalURL(baseURL)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clean+"/", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("could not reach the external transcription server: %w", err)
+	}
+	resp.Body.Close()
+	return nil
+}
+
+func (m *MeetingService) ensureTranscriptionIdle() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running {
+		return errors.New("stop the active meeting before changing the transcription model")
+	}
+	return nil
+}
+
+func (m *MeetingService) validateTranscriptionSettings(settings store.Settings) error {
+	switch settings.SttEngine {
+	case "external":
+		_, err := normalizeExternalURL(settings.SttBaseURL)
+		return err
+	case "nemotron":
+		if !m.hasNVIDIAGPU() {
+			return errors.New("Nemotron requires a working NVIDIA GPU")
+		}
+		_, err := m.newNemotron()
+		if err != nil {
+			return fmt.Errorf("Nemotron is not fully installed: %w", err)
+		}
+		return nil
+	case "whisper":
+		_, _, err := m.newCPUWhisper(settings, false)
+		return err
+	case "auto", "":
+		if m.hasNVIDIAGPU() {
+			if _, err := m.newNemotron(); err == nil {
+				return nil
+			}
+		}
+		_, _, err := m.newCPUWhisper(settings, true)
+		return err
+	default:
+		return fmt.Errorf("unsupported transcription engine %q", settings.SttEngine)
+	}
+}
+
+func settingsForTranscriptionConfig(current store.Settings, config TranscriptionConfig) (store.Settings, error) {
+	modelID := strings.TrimSpace(config.ModelID)
+	next := current
+	next.SttBaseURL = strings.TrimSpace(config.ExternalURL)
+	switch {
+	case modelID == "auto":
+		next.SttEngine = "auto"
+	case modelID == "nemotron":
+		next.SttEngine = "nemotron"
+	case modelID == "external":
+		next.SttEngine = "external"
+		clean, err := normalizeExternalURL(config.ExternalURL)
+		if err != nil {
+			return store.Settings{}, err
+		}
+		next.SttBaseURL = clean
+	case strings.HasPrefix(modelID, "whisper:"):
+		name := strings.TrimSpace(strings.TrimPrefix(modelID, "whisper:"))
+		if name == "" || filepath.Base(name) != name || !strings.HasSuffix(strings.ToLower(name), ".bin") {
+			return store.Settings{}, errors.New("select an installed Whisper model")
+		}
+		next.SttEngine = "whisper"
+		next.WhisperModel = name
+	default:
+		return store.Settings{}, fmt.Errorf("unsupported transcription model %q", modelID)
+	}
+	return next, nil
+}
+
+func normalizeExternalURL(raw string) (string, error) {
+	clean := strings.TrimRight(strings.TrimSpace(raw), "/")
+	parsed, err := url.Parse(clean)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", errors.New("enter a complete external transcription URL beginning with http:// or https://")
+	}
+	return clean, nil
+}
+
+func nemotronUnavailableReason(hasGPU bool) string {
+	if !hasGPU {
+		return "A working NVIDIA GPU was not detected."
+	}
+	paths := []string{
+		filepath.Join("resources", "nemotron", ".ready"),
+		filepath.Join("resources", "nemotron", "runtime", "Scripts", "python.exe"),
+		filepath.Join("resources", "nemotron", "server.py"),
+		filepath.Join("resources", "nemotron", "model", "config.json"),
+		filepath.Join("resources", "nemotron", "model", "model.safetensors"),
+	}
+	for _, path := range paths {
+		if _, err := resolveResource(path); err != nil {
+			return "The Nemotron runtime or model installation is incomplete."
+		}
+	}
+	return ""
+}
+
+func installedWhisperModels() ([]string, error) {
+	dir, err := resolveResource(filepath.Join("resources", "whisper", "models"))
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".bin") {
+			models = append(models, entry.Name())
+		}
+	}
+	sort.Strings(models)
+	return models, nil
 }
 
 // anyInstalledModel returns the first *.bin model present under
@@ -511,14 +938,12 @@ func anyInstalledModel() (path, name string, ok bool) {
 	if err != nil {
 		return "", "", false
 	}
-	entries, err := os.ReadDir(dir)
+	models, err := installedWhisperModels()
 	if err != nil {
 		return "", "", false
 	}
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".bin") {
-			return filepath.Join(dir, e.Name()), e.Name(), true
-		}
+	if len(models) > 0 {
+		return filepath.Join(dir, models[0]), models[0], true
 	}
 	return "", "", false
 }

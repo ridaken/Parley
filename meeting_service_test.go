@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -123,7 +125,7 @@ func TestServiceStartupPreloadsAndReusesNemotron(t *testing.T) {
 	nemotron.release = make(chan struct{})
 	m.hasNVIDIAGPU = func() bool { return true }
 	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
-	m.newCPUWhisper = func(store.Settings) (managedSTTServer, string, error) {
+	m.newCPUWhisper = func(store.Settings, bool) (managedSTTServer, string, error) {
 		return nil, "", errors.New("CPU fallback should not be used")
 	}
 
@@ -191,7 +193,7 @@ func TestLocalEnginePreloadFallsBackToCPU(t *testing.T) {
 	whisper := newFakeManagedSTTServer()
 	m.hasNVIDIAGPU = func() bool { return true }
 	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
-	m.newCPUWhisper = func(store.Settings) (managedSTTServer, string, error) {
+	m.newCPUWhisper = func(store.Settings, bool) (managedSTTServer, string, error) {
 		return whisper, "ggml-small.en-q5_1.bin", nil
 	}
 
@@ -224,6 +226,7 @@ func TestGetRuntimeInfoReportsResolvedLocalModel(t *testing.T) {
 		server: newFakeManagedSTTServer(),
 		model:  "Whisper ggml-small.en-q5_1.bin · CPU",
 	}
+	m.localState = "ready"
 
 	got := m.GetRuntimeInfo()
 	if got.AppVersion != appVersion {
@@ -244,15 +247,16 @@ func TestGetRuntimeInfoReportsRemoteServer(t *testing.T) {
 		t.Fatalf("GetSettings: %v", err)
 	}
 	settings.SttBaseURL = " http://transcription.local:8765/ "
+	settings.SttEngine = "external"
 	if err := s.SaveSettings(settings); err != nil {
 		t.Fatalf("SaveSettings: %v", err)
 	}
 
 	got := NewMeetingService(s).GetRuntimeInfo()
-	if got.TranscriptionStatus != "ready" {
-		t.Fatalf("TranscriptionStatus = %q, want ready", got.TranscriptionStatus)
+	if got.TranscriptionStatus != "configured" {
+		t.Fatalf("TranscriptionStatus = %q, want configured", got.TranscriptionStatus)
 	}
-	if got.TranscriptionModel != "Remote model · http://transcription.local:8765" {
+	if got.TranscriptionModel != "External · http://transcription.local:8765" {
 		t.Fatalf("TranscriptionModel = %q", got.TranscriptionModel)
 	}
 }
@@ -264,7 +268,7 @@ func TestServiceShutdownCancelsInProgressPreload(t *testing.T) {
 	nemotron.release = make(chan struct{})
 	m.hasNVIDIAGPU = func() bool { return true }
 	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
-	m.newCPUWhisper = func(store.Settings) (managedSTTServer, string, error) {
+	m.newCPUWhisper = func(store.Settings, bool) (managedSTTServer, string, error) {
 		return nil, "", errors.New("shutdown should prevent fallback startup")
 	}
 
@@ -290,5 +294,128 @@ func TestServiceShutdownCancelsInProgressPreload(t *testing.T) {
 	}
 	if m.localResult.server != nil {
 		t.Fatal("canceled preload retained a server")
+	}
+}
+
+func TestExplicitNemotronFailureDoesNotFallBack(t *testing.T) {
+	m := NewMeetingService(nil)
+	nemotron := newFakeManagedSTTServer()
+	nemotron.startErr = errors.New("CUDA failed")
+	cpuCalls := 0
+	m.hasNVIDIAGPU = func() bool { return true }
+	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
+	m.newCPUWhisper = func(store.Settings, bool) (managedSTTServer, string, error) {
+		cpuCalls++
+		return newFakeManagedSTTServer(), "fallback.bin", nil
+	}
+
+	_, err := m.loadLocalEngine(context.Background(), store.Settings{SttEngine: "nemotron"})
+	if err == nil {
+		t.Fatal("explicit Nemotron failure should be returned")
+	}
+	if cpuCalls != 0 {
+		t.Fatalf("explicit Nemotron used CPU fallback %d times", cpuCalls)
+	}
+}
+
+func TestConfigureExternalStopsLocalModelAndPersists(t *testing.T) {
+	s := openMeetingTestStore(t)
+	m := NewMeetingService(s)
+	local := newFakeManagedSTTServer()
+	done := make(chan struct{})
+	close(done)
+	m.localDone = done
+	m.localResult = localEngineResult{server: local, model: "Whisper current.bin · CPU"}
+	m.localState = "ready"
+
+	if err := m.ConfigureTranscription(TranscriptionConfig{
+		ModelID: "external", ExternalURL: " http://stt.example:8765/ ",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if local.stopCalls.Load() != 1 {
+		t.Fatalf("local model Stop calls = %d, want 1", local.stopCalls.Load())
+	}
+	settings, _ := s.GetSettings()
+	if settings.SttEngine != "external" || settings.SttBaseURL != "http://stt.example:8765" {
+		t.Fatalf("persisted transcription settings = %+v", settings)
+	}
+	if got := m.GetRuntimeInfo(); got.TranscriptionStatus != "configured" || got.TranscriptionKind != "external" {
+		t.Fatalf("runtime info = %+v", got)
+	}
+}
+
+func TestLocalModelCanStopAndStartAgain(t *testing.T) {
+	s := openMeetingTestStore(t)
+	settings, _ := s.GetSettings()
+	settings.SttEngine = "whisper"
+	settings.WhisperModel = "test.bin"
+	if err := s.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewMeetingService(s)
+	whisper := newFakeManagedSTTServer()
+	m.newCPUWhisper = func(store.Settings, bool) (managedSTTServer, string, error) {
+		return whisper, "test.bin", nil
+	}
+	if err := m.StartTranscriptionModel(); err != nil {
+		t.Fatal(err)
+	}
+	waitForLocalLoad(t, m)
+	if err := m.StopTranscriptionModel(); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.GetRuntimeInfo().TranscriptionStatus; got != "stopped" {
+		t.Fatalf("status after Stop = %q", got)
+	}
+	if err := m.StartTranscriptionModel(); err != nil {
+		t.Fatal(err)
+	}
+	waitForLocalLoad(t, m)
+	if whisper.startCalls.Load() != 2 || whisper.stopCalls.Load() != 1 {
+		t.Fatalf("lifecycle calls Start=%d Stop=%d", whisper.startCalls.Load(), whisper.stopCalls.Load())
+	}
+	m.shutdownLocalEngine()
+}
+
+func TestTranscriptionLifecycleBlockedDuringMeeting(t *testing.T) {
+	m := NewMeetingService(openMeetingTestStore(t))
+	m.running = true
+	if err := m.StopTranscriptionModel(); err == nil {
+		t.Fatal("StopTranscriptionModel should reject an active meeting")
+	}
+	if err := m.ConfigureTranscription(TranscriptionConfig{ModelID: "external", ExternalURL: "http://stt.example"}); err == nil {
+		t.Fatal("ConfigureTranscription should reject an active meeting")
+	}
+}
+
+func TestExternalTranscriptionReachability(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	m := NewMeetingService(nil)
+	if err := m.TestExternalTranscription(server.URL); err != nil {
+		t.Fatalf("any HTTP response should count as reachable: %v", err)
+	}
+	if err := m.TestExternalTranscription("not-a-url"); err == nil {
+		t.Fatal("invalid external URL should fail validation")
+	}
+}
+
+func waitForLocalLoad(t *testing.T, m *MeetingService) {
+	t.Helper()
+	m.localMu.Lock()
+	done := m.localDone
+	m.localMu.Unlock()
+	if done == nil {
+		t.Fatal("local model load was not started")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("local model load did not finish")
 	}
 }
