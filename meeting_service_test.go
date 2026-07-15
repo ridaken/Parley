@@ -104,8 +104,8 @@ func TestServiceStartupPreloadsAndReusesNemotron(t *testing.T) {
 	nemotron.release = make(chan struct{})
 	m.hasNVIDIAGPU = func() bool { return true }
 	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
-	m.newCPUWhisper = func(store.Settings) (managedSTTServer, error) {
-		return nil, errors.New("CPU fallback should not be used")
+	m.newCPUWhisper = func(store.Settings) (managedSTTServer, string, error) {
+		return nil, "", errors.New("CPU fallback should not be used")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -172,7 +172,9 @@ func TestLocalEnginePreloadFallsBackToCPU(t *testing.T) {
 	whisper := newFakeManagedSTTServer()
 	m.hasNVIDIAGPU = func() bool { return true }
 	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
-	m.newCPUWhisper = func(store.Settings) (managedSTTServer, error) { return whisper, nil }
+	m.newCPUWhisper = func(store.Settings) (managedSTTServer, string, error) {
+		return whisper, "ggml-small.en-q5_1.bin", nil
+	}
 
 	result, err := m.waitLocalEngine(context.Background(), store.Settings{})
 	if err != nil {
@@ -193,6 +195,49 @@ func TestLocalEnginePreloadFallsBackToCPU(t *testing.T) {
 	}
 }
 
+func TestGetRuntimeInfoReportsResolvedLocalModel(t *testing.T) {
+	s := openMeetingTestStore(t)
+	m := NewMeetingService(s)
+	done := make(chan struct{})
+	close(done)
+	m.localDone = done
+	m.localResult = localEngineResult{
+		server: newFakeManagedSTTServer(),
+		model:  "Whisper ggml-small.en-q5_1.bin · CPU",
+	}
+
+	got := m.GetRuntimeInfo()
+	if got.AppVersion != appVersion {
+		t.Fatalf("AppVersion = %q, want %q", got.AppVersion, appVersion)
+	}
+	if got.TranscriptionStatus != "ready" {
+		t.Fatalf("TranscriptionStatus = %q, want ready", got.TranscriptionStatus)
+	}
+	if got.TranscriptionModel != "Whisper ggml-small.en-q5_1.bin · CPU" {
+		t.Fatalf("TranscriptionModel = %q", got.TranscriptionModel)
+	}
+}
+
+func TestGetRuntimeInfoReportsRemoteServer(t *testing.T) {
+	s := openMeetingTestStore(t)
+	settings, err := s.GetSettings()
+	if err != nil {
+		t.Fatalf("GetSettings: %v", err)
+	}
+	settings.SttBaseURL = " http://transcription.local:8765/ "
+	if err := s.SaveSettings(settings); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	got := NewMeetingService(s).GetRuntimeInfo()
+	if got.TranscriptionStatus != "ready" {
+		t.Fatalf("TranscriptionStatus = %q, want ready", got.TranscriptionStatus)
+	}
+	if got.TranscriptionModel != "Remote model · http://transcription.local:8765" {
+		t.Fatalf("TranscriptionModel = %q", got.TranscriptionModel)
+	}
+}
+
 func TestServiceShutdownCancelsInProgressPreload(t *testing.T) {
 	s := openMeetingTestStore(t)
 	m := NewMeetingService(s)
@@ -200,8 +245,8 @@ func TestServiceShutdownCancelsInProgressPreload(t *testing.T) {
 	nemotron.release = make(chan struct{})
 	m.hasNVIDIAGPU = func() bool { return true }
 	m.newNemotron = func() (managedSTTServer, error) { return nemotron, nil }
-	m.newCPUWhisper = func(store.Settings) (managedSTTServer, error) {
-		return nil, errors.New("shutdown should prevent fallback startup")
+	m.newCPUWhisper = func(store.Settings) (managedSTTServer, string, error) {
+		return nil, "", errors.New("shutdown should prevent fallback startup")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

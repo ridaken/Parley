@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 
 import { MeetingService, LibraryService } from "../bindings/github.com/tomvokac/parley";
-import type { StatusEvent } from "../bindings/github.com/tomvokac/parley";
+import type { RuntimeInfo, StatusEvent } from "../bindings/github.com/tomvokac/parley";
 import type { Segment } from "../bindings/github.com/tomvokac/parley/internal/stt/models";
 import type { State as AnalysisState, Suggestion } from "../bindings/github.com/tomvokac/parley/internal/analysis/models";
 import type { LiveNote, LLMConnection } from "../bindings/github.com/tomvokac/parley/internal/store/models";
@@ -149,6 +149,11 @@ function App() {
   const [conns, setConns] = useState<LLMConnection[]>([]);
   const [activeConnId, setActiveConnId] = useState<number>(0);
   const [activeContext, setActiveContext] = useState<string | null>(null);
+  const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo>({
+    appVersion: "",
+    transcriptionModel: "Loading local model…",
+    transcriptionStatus: "loading",
+  });
   // Session-scoped suggestion pins/dismissals, keyed by normalized text. The
   // `analysis` listener is registered once, so it reads these via refs to avoid a
   // stale closure.
@@ -248,6 +253,21 @@ function App() {
       })
       .catch(() => {});
 
+    // Subscribe before requesting the snapshot so a fast model-load completion
+    // cannot race between the initial response and event registration.
+    const offRuntimeInfo = Events.On("runtimeInfo", (e: { data: RuntimeInfo }) => {
+      setRuntimeInfo(e.data);
+    });
+    MeetingService.GetRuntimeInfo()
+      .then(setRuntimeInfo)
+      .catch(() =>
+        setRuntimeInfo((info) => ({
+          ...info,
+          transcriptionModel: "Model status unavailable",
+          transcriptionStatus: "error",
+        }))
+      );
+
     const offStatus = Events.On("status", (e: { data: StatusEvent }) => {
       setStatus(e.data);
       setBusy(false);
@@ -306,6 +326,7 @@ function App() {
       offTranscript();
       offAnalysisStatus();
       offAnalysis();
+      offRuntimeInfo();
     };
   }, []);
 
@@ -703,6 +724,24 @@ function App() {
           onDismiss={dismissSuggestion}
         />
       </main>
+
+      <footer className="flex h-7 shrink-0 items-center justify-between gap-4 border-t px-5 text-[11px] text-muted-foreground">
+        <span className="shrink-0 tabular-nums">
+          Parley{runtimeInfo.appVersion ? ` v${runtimeInfo.appVersion}` : ""}
+        </span>
+        <span
+          className="flex min-w-0 items-center gap-1.5"
+          title={`Voice-to-text model: ${runtimeInfo.transcriptionModel}`}
+        >
+          {runtimeInfo.transcriptionStatus === "loading" && (
+            <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+          )}
+          <span className="shrink-0">Voice-to-text:</span>
+          <span className="truncate text-foreground/75">
+            {runtimeInfo.transcriptionModel}
+          </span>
+        </span>
+      </footer>
 
       <AudioDialog open={audioOpen} onOpenChange={setAudioOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />

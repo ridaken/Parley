@@ -35,6 +35,21 @@ export interface LoadedSession {
 }
 
 /**
+ * RuntimeInfo is the build and transcription metadata currently in use. The
+ * frontend displays it persistently so packaged-version or model-selection
+ * problems can be identified without opening log files.
+ */
+export interface RuntimeInfo {
+    "appVersion": string;
+    "transcriptionModel": string;
+
+    /**
+     * loading | ready | error
+     */
+    "transcriptionStatus": string;
+}
+
+/**
  * StatusEvent is broadcast whenever the capture/transcription state changes.
  */
 export interface StatusEvent {

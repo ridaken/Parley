@@ -21,6 +21,7 @@ func init() {
 	// Register events so the binding generator produces typed JS/TS APIs.
 	application.RegisterEvent[StatusEvent]("status")
 	application.RegisterEvent[AnalysisStatusEvent]("analysisStatus")
+	application.RegisterEvent[RuntimeInfo]("runtimeInfo")
 	application.RegisterEvent[stt.Segment]("transcript")
 	application.RegisterEvent[analysis.State]("analysis")
 }
