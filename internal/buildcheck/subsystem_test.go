@@ -40,9 +40,14 @@ func TestInstallerOffersMissingNemotronOnUpgrade(t *testing.T) {
 		`StrCmp $IsUpgrade "0" nemotron_provision`,
 		`MessageBox MB_YESNO|MB_ICONQUESTION`,
 		`IfSilent nemotron_silent_skip`,
+		`${DisableX64FSRedirection}`,
+		`nsExec::ExecToStack '"$SYSDIR\nvidia-smi.exe" -L'`,
 	} {
 		if !strings.Contains(installer, required) {
 			t.Fatalf("%s no longer contains %q; missing Nemotron upgrades will not be handled safely", path, required)
 		}
+	}
+	if strings.Contains(installer, "cmd /C nvidia-smi") {
+		t.Fatalf("%s probes nvidia-smi through 32-bit cmd; WOW64 redirection hides the System32 executable", path)
 	}
 }
