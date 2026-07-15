@@ -94,9 +94,11 @@ class StreamingSession:
             self.condition.notify_all()
             worker = self.worker
         if worker is not None:
-            worker.join(timeout=30)
-            if worker.is_alive():
-                raise TimeoutError(f"stream {self.stream_id!r} did not finish within 30 seconds")
+            # The Go request context owns the finalization deadline (normally up
+            # to five minutes during meeting shutdown). Do not return while this
+            # thread still uses the model: stream_finish() returns the model to
+            # the shared pool immediately after this method exits.
+            worker.join()
         return self.read_delta(wait_seconds=0)
 
     def read_delta(self, wait_seconds: float) -> str:

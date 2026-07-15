@@ -89,8 +89,8 @@ export function Resume(id: number): $CancellablePromise<void> {
 }
 
 /**
- * Start launches a fresh meeting: whisper server, capture, transcription, and a
- * new persisted session.
+ * Start launches a fresh meeting using the app's preloaded transcription engine,
+ * then starts capture and a new persisted session.
  */
 export function Start(): $CancellablePromise<void> {
     return $Call.ByID(4124033072);

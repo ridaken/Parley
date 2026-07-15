@@ -18,9 +18,16 @@ type Client struct {
 	http    *http.Client
 }
 
+const (
+	standardRequestTimeout = 2 * time.Minute
+	streamFinishTimeout    = 5 * time.Minute
+)
+
 // NewClient builds a transcription client for the given server base URL.
 func NewClient(baseURL string) *Client {
-	return &Client{baseURL: baseURL, http: &http.Client{Timeout: 120 * time.Second}}
+	// Request contexts own timeout policy. In particular, stream finalization has
+	// a longer budget than ordinary feed calls so it can drain buffered audio.
+	return &Client{baseURL: baseURL, http: &http.Client{}}
 }
 
 type inferenceResponse struct {
@@ -29,6 +36,8 @@ type inferenceResponse struct {
 
 // Transcribe sends a WAV payload and returns the recognised text (trimmed).
 func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, standardRequestTimeout)
+	defer cancel()
 	return c.postMultipart(ctx, "/inference", map[string]string{
 		"response_format": "json",
 		"temperature":     "0.0",
@@ -38,6 +47,8 @@ func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
 // StreamFeed advances one persistent cache-aware ASR stream and returns any new
 // text the model has emitted. streamID is normally the stable audio source label.
 func (c *Client) StreamFeed(ctx context.Context, streamID string, wav []byte) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, standardRequestTimeout)
+	defer cancel()
 	return c.postMultipart(ctx, "/stream", map[string]string{
 		"stream_id": streamID,
 		"action":    "feed",
@@ -46,6 +57,8 @@ func (c *Client) StreamFeed(ctx context.Context, streamID string, wav []byte) (s
 
 // StreamFinish flushes and closes a persistent ASR stream.
 func (c *Client) StreamFinish(ctx context.Context, streamID string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, streamFinishTimeout)
+	defer cancel()
 	return c.postMultipart(ctx, "/stream", map[string]string{
 		"stream_id": streamID,
 		"action":    "finish",
