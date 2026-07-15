@@ -24,3 +24,25 @@ func TestWindowsProductionBuildIsGUISubsystem(t *testing.T) {
 			"BUILD_FLAGS ldflags.", path)
 	}
 }
+
+// Existing Parley users may predate optional Nemotron provisioning. An upgrade
+// must preserve a complete install, but offer an interactive download when the
+// readiness marker is absent instead of silently leaving GPU users on Whisper.
+func TestInstallerOffersMissingNemotronOnUpgrade(t *testing.T) {
+	path := filepath.Join("..", "..", "build", "windows", "nsis", "project.nsi")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	installer := string(data)
+	for _, required := range []string{
+		`IfFileExists "$INSTDIR\resources\nemotron\.ready"`,
+		`StrCmp $IsUpgrade "0" nemotron_provision`,
+		`MessageBox MB_YESNO|MB_ICONQUESTION`,
+		`IfSilent nemotron_silent_skip`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("%s no longer contains %q; missing Nemotron upgrades will not be handled safely", path, required)
+		}
+	}
+}

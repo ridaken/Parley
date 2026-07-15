@@ -123,27 +123,59 @@ Section
     RMDir /r "$INSTDIR\resources\whisper"
     File /r "..\..\..\resources"
 
-    # On a fresh NVIDIA installation, provision Nemotron from its upstream
-    # repositories. This is deliberately non-fatal: an offline machine, an old
-    # driver, or a failed model download leaves bundled CPU Whisper available.
-    # Upgrades reuse the existing runtime/model and never redownload it.
-    ${If} $IsUpgrade == "0"
+    # A complete Nemotron install is persistent and automatically preferred by
+    # the app. Fresh NVIDIA installs provision it automatically. On upgrades
+    # where it is missing (including an earlier partial download), ask before
+    # downloading several GB. Silent upgrades never start a surprise download.
+    # Every failure/decline remains non-fatal because CPU Whisper is bundled.
+    IfFileExists "$INSTDIR\resources\nemotron\.ready" nemotron_present nemotron_probe_gpu
+
+    nemotron_probe_gpu:
         nsExec::ExecToStack 'cmd /C nvidia-smi -L'
         Pop $1
         Pop $2
-        ${If} $1 == 0
-            DetailPrint "NVIDIA GPU detected; provisioning Nemotron 3.5 ASR Streaming..."
-            nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\nemotron\setup.ps1" -InstallRoot "$INSTDIR\resources\nemotron"'
-            Pop $1
-            ${If} $1 != 0
-                DetailPrint "Nemotron provisioning did not complete (exit $1). Parley will use bundled CPU Whisper."
-            ${EndIf}
-        ${Else}
-            DetailPrint "No NVIDIA GPU detected; using bundled CPU Whisper."
-        ${EndIf}
-    ${Else}
-        DetailPrint "Upgrade detected; preserving the existing Nemotron installation."
-    ${EndIf}
+        StrCmp $1 "0" nemotron_gpu_found nemotron_no_gpu
+
+    nemotron_gpu_found:
+        StrCmp $IsUpgrade "0" nemotron_provision
+        IfSilent nemotron_silent_skip
+        MessageBox MB_YESNO|MB_ICONQUESTION "Parley found an NVIDIA GPU, but Nemotron 3.5 ASR Streaming is not installed.$\r$\n$\r$\nDownload and install it now? This can download several gigabytes and may take several minutes. CPU Whisper remains available if you choose No." /SD IDNO IDYES nemotron_provision IDNO nemotron_declined
+
+    nemotron_provision:
+        DetailPrint "NVIDIA GPU detected; provisioning Nemotron 3.5 ASR Streaming..."
+        nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\nemotron\setup.ps1" -InstallRoot "$INSTDIR\resources\nemotron"'
+        Pop $1
+        StrCmp $1 "0" 0 nemotron_provision_failed
+        IfFileExists "$INSTDIR\resources\nemotron\.ready" nemotron_provisioned nemotron_not_ready
+
+    nemotron_provisioned:
+        DetailPrint "Nemotron provisioning completed; Parley will use it automatically."
+        Goto nemotron_done
+
+    nemotron_present:
+        DetailPrint "Existing Nemotron installation detected; Parley will use it automatically."
+        Goto nemotron_done
+
+    nemotron_no_gpu:
+        DetailPrint "No NVIDIA GPU detected; using bundled CPU Whisper."
+        Goto nemotron_done
+
+    nemotron_declined:
+        DetailPrint "Nemotron download declined; using bundled CPU Whisper."
+        Goto nemotron_done
+
+    nemotron_silent_skip:
+        DetailPrint "Silent upgrade detected; skipping optional Nemotron download and using bundled CPU Whisper."
+        Goto nemotron_done
+
+    nemotron_not_ready:
+        DetailPrint "Nemotron was not provisioned for this GPU; Parley will use bundled CPU Whisper."
+        Goto nemotron_done
+
+    nemotron_provision_failed:
+        DetailPrint "Nemotron provisioning did not complete (exit $1). Parley will use bundled CPU Whisper."
+
+    nemotron_done:
 
     SetOutPath $INSTDIR
 
