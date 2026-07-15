@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,18 +60,31 @@ func TestStreamingChunkerCoalescesDeltasAtWordLimit(t *testing.T) {
 	default:
 	}
 
-	chunker.Feed(audio.You, loud((streamTranscriptMaxWords-4)*frameSamples))
+	chunker.Feed(audio.You, loud((streamTranscriptMaxWords-5)*frameSamples))
+	chunker.flush(context.Background())
+	if calls.Load() != streamTranscriptMaxWords-1 {
+		t.Fatalf("feed calls = %d, want %d", calls.Load(), streamTranscriptMaxWords-1)
+	}
+	select {
+	case segment := <-segments:
+		t.Fatalf("text emitted before the word limit: %+v", segment)
+	default:
+	}
+
+	chunker.Feed(audio.You, loud(frameSamples))
 	chunker.flush(context.Background())
 	if calls.Load() != streamTranscriptMaxWords {
 		t.Fatalf("feed calls = %d, want %d", calls.Load(), streamTranscriptMaxWords)
 	}
 	select {
 	case segment := <-segments:
-		if segment.Text != "word word word word word word word word word word word word" {
+		wantText := strings.TrimSpace(strings.Repeat("word ", streamTranscriptMaxWords))
+		if segment.Text != wantText {
 			t.Fatalf("coalesced text = %q", segment.Text)
 		}
-		if segment.StartMs != 0 || segment.EndMs != 3840 {
-			t.Fatalf("segment timing = %d/%d, want 0/3840", segment.StartMs, segment.EndMs)
+		wantEndMs := int64(streamTranscriptMaxWords) * window.Milliseconds()
+		if segment.StartMs != 0 || segment.EndMs != wantEndMs {
+			t.Fatalf("segment timing = %d/%d, want 0/%d", segment.StartMs, segment.EndMs, wantEndMs)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("streaming chunker did not emit a coalesced segment")

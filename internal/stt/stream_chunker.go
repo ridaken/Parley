@@ -14,7 +14,7 @@ import (
 const (
 	// Keep transcript rows readable while still bounding how long an unpunctuated
 	// utterance can grow (for example, dictation without sentence punctuation).
-	streamTranscriptMaxWords = 12
+	streamTranscriptMaxWords = 25
 
 	// RNNT decoding can retain the last token until it sees an utterance boundary.
 	// Closing the stream after three silent 320 ms frames flushes that token while
