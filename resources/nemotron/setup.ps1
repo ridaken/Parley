@@ -138,14 +138,14 @@ foreach ($supportFile in @("download_model.py", "server.py", "validate_install.p
 
 if (Test-CompleteNemotronInstall $InstallRoot) {
     Write-Host "Nemotron 3.5 ASR is already provisioned; keeping the existing installation."
-    exit 0
+    return
 }
 
 if (Test-Path $sourceRootMarker) {
     $sourceRoot = (Get-Content $sourceRootMarker -Raw).Trim().TrimStart([char]0xFEFF)
     if (Test-CompleteNemotronInstall $sourceRoot) {
         Write-Host "Nemotron 3.5 ASR is already provisioned at $sourceRoot; reusing it."
-        exit 0
+        return
     }
     Remove-Item $sourceRootMarker -Force -ErrorAction SilentlyContinue
 }
@@ -154,17 +154,17 @@ $existingRoot = Find-ExistingNemotronInstall -TargetRoot $InstallRoot -SearchUse
 if ($existingRoot) {
     Write-SourceRoot -TargetRoot $InstallRoot -SourceRoot $existingRoot
     Write-Host "Reusing existing Nemotron 3.5 ASR installation at $existingRoot."
-    exit 0
+    return
 }
 if ($ReuseOnly) {
     Write-Host "No reusable Nemotron installation was found."
-    exit 0
+    return
 }
 
 $gpu = & nvidia-smi -L 2>$null
 if ($LASTEXITCODE -ne 0 -or -not ($gpu -match "GPU ")) {
     Write-Host "No usable NVIDIA GPU detected; Parley will use bundled CPU Whisper."
-    exit 0
+    return
 }
 
 # Each checkpoint instance is about 1.3 GB in FP16 and Parley's two concurrent
@@ -195,7 +195,7 @@ foreach ($row in $gpuRows) {
 }
 if (-not $eligibleGPU) {
     Write-Host "No NVIDIA GPU with at least 6 GiB VRAM and compute capability 7.0+ was found; using CPU Whisper."
-    exit 0
+    return
 }
 Write-Host "Eligible NVIDIA GPU detected: $eligibleGPU"
 
@@ -225,8 +225,30 @@ if (-not (Test-Path $uvExe)) {
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $InstallRoot "python"
 $env:UV_CACHE_DIR = Join-Path $InstallRoot "cache/uv"
 $env:UV_LINK_MODE = "copy"
+
+# Keep the large cache private to Parley without hiding a token created by a
+# previous `hf auth login`. HF_TOKEN still takes precedence when explicitly set.
+if ([string]::IsNullOrWhiteSpace($env:HF_TOKEN) -and [string]::IsNullOrWhiteSpace($env:HF_TOKEN_PATH)) {
+    $userCache = if ([string]::IsNullOrWhiteSpace($env:XDG_CACHE_HOME)) {
+        Join-Path $HOME ".cache"
+    }
+    else {
+        $env:XDG_CACHE_HOME
+    }
+    $existingToken = Join-Path $userCache "huggingface/token"
+    if (Test-Path $existingToken) {
+        $env:HF_TOKEN_PATH = $existingToken
+        Write-Host "Using the existing Hugging Face login for authenticated downloads."
+    }
+}
 $env:HF_HOME = Join-Path $InstallRoot "cache/huggingface"
 $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+if ([string]::IsNullOrWhiteSpace($env:HF_XET_HIGH_PERFORMANCE)) {
+    $env:HF_XET_HIGH_PERFORMANCE = "1"
+}
+if ([string]::IsNullOrWhiteSpace($env:HF_HUB_DOWNLOAD_TIMEOUT)) {
+    $env:HF_HUB_DOWNLOAD_TIMEOUT = "60"
+}
 
 if (-not (Test-Path $pythonExe)) {
     Write-Host "Installing private Python 3.11 runtime..."
