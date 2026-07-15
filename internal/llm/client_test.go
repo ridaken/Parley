@@ -19,9 +19,6 @@ func TestCompleteReturnsContent(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if req.MaxTokens != defaultMaxTokens {
-			t.Fatalf("max_tokens = %d, want %d", req.MaxTokens, defaultMaxTokens)
-		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{
 				{"message": map[string]any{"role": "assistant", "content": "pong"}},
@@ -42,6 +39,52 @@ func TestCompleteReturnsContent(t *testing.T) {
 	}
 	if got != "pong" {
 		t.Fatalf("got %q, want pong", got)
+	}
+}
+
+func TestCompleteDoesNotImposeMaxTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if _, ok := req["max_tokens"]; ok {
+			t.Fatalf("request should let the provider choose its completion limit: %+v", req)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "pong"}, "finish_reason": "stop"}},
+		})
+	}))
+	defer srv.Close()
+
+	if _, err := NewClient(srv.URL, "", "m").Complete(context.Background(), []Message{{Role: "user", Content: "ping"}}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+}
+
+func TestCompleteReportsLengthTruncation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message":       map[string]any{"content": `{"partial":"value`},
+				"finish_reason": "length",
+			}},
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+		})
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, "", "m").Complete(context.Background(), []Message{{Role: "user", Content: "ping"}})
+	if err == nil || !strings.Contains(err.Error(), "completion truncated") {
+		t.Fatalf("expected explicit truncation error, got %v", err)
+	}
+	var reqErr *RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("expected RequestError, got %T", err)
+	}
+	diag := reqErr.Diagnostics()
+	if diag.FinishReason != "length" || diag.PromptTokens != 10 || diag.CompletionTokens != 20 || diag.TotalTokens != 30 {
+		t.Fatalf("missing completion diagnostics: %+v", diag)
 	}
 }
 

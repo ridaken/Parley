@@ -16,6 +16,13 @@ build/android/gen/
 resources/whisper/bin/
 resources/whisper/models/
 resources/whisper/*.zip
+resources/nemotron/.ready
+resources/nemotron/cache/
+resources/nemotron/model/
+resources/nemotron/python/
+resources/nemotron/runtime/
+resources/nemotron/tools/
+__pycache__/
 # Captured/recorded audio
 capture.wav
 *.recording.wav

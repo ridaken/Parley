@@ -24,10 +24,30 @@ import (
 )
 
 const (
-	whisperHost = "127.0.0.1"
-	whisperPort = 8765
-	chunkWindow = 5 * time.Second
+	whisperHost       = "127.0.0.1"
+	whisperPort       = 8765
+	chunkWindow       = 5 * time.Second
+	streamChunkWindow = 320 * time.Millisecond
 )
+
+type transcriptChunker interface {
+	Feed(audio.Source, []int16)
+	Start()
+	Stop()
+	StopWithTimeout(time.Duration)
+}
+
+type managedSTTServer interface {
+	Start(context.Context) error
+	Stop()
+	URL() string
+}
+
+type localEngineResult struct {
+	server    managedSTTServer
+	streaming bool
+	name      string
+}
 
 // StatusEvent is broadcast whenever the capture/transcription state changes.
 type StatusEvent struct {
@@ -92,9 +112,22 @@ type MeetingService struct {
 	mu       sync.Mutex
 	running  bool
 	capturer *audio.Capturer
-	chunker  *stt.Chunker
-	server   *stt.Server
+	chunker  transcriptChunker
 	engine   *analysis.Engine
+
+	// The local transcription server belongs to the app, not an individual
+	// meeting. ServiceStartup begins loading it in the background; Start waits on
+	// the same result if preparation is still underway, and ServiceShutdown is the
+	// only normal path that releases the model weights.
+	localMu     sync.Mutex
+	localDone   chan struct{}
+	localCancel context.CancelFunc
+	localResult localEngineResult
+	localErr    error
+
+	hasNVIDIAGPU  func() bool
+	newNemotron   func() (managedSTTServer, error)
+	newCPUWhisper func(store.Settings) (managedSTTServer, error)
 
 	sessionID     atomic.Int64 // active session row; 0 when not persisting
 	lastSessionID atomic.Int64 // most recent persisted session, retained after Stop for export
@@ -115,7 +148,33 @@ type LoadedSession struct {
 
 // NewMeetingService constructs the service.
 func NewMeetingService(s *store.Store) *MeetingService {
-	return &MeetingService{store: s, recorders: make(map[audio.Source]*audio.MonoWAVWriter)}
+	m := &MeetingService{
+		store:        s,
+		recorders:    make(map[audio.Source]*audio.MonoWAVWriter),
+		hasNVIDIAGPU: stt.HasNVIDIAGPU,
+	}
+	m.newNemotron = func() (managedSTTServer, error) { return newNemotronServer() }
+	m.newCPUWhisper = func(settings store.Settings) (managedSTTServer, error) {
+		return newCPUWhisperServer(settings)
+	}
+	return m
+}
+
+// ServiceStartup begins loading the configured local transcription engine as
+// soon as Parley opens. Preparation is deliberately asynchronous so model I/O
+// never delays creation of the application window.
+func (m *MeetingService) ServiceStartup(ctx context.Context, _ application.ServiceOptions) error {
+	settings, err := m.store.GetSettings()
+	if err != nil {
+		log.Printf("[stt] could not read settings for startup preload: %v", err)
+		return nil
+	}
+	if strings.TrimSpace(settings.SttBaseURL) != "" {
+		log.Printf("[stt] remote transcription configured; skipping local model preload")
+		return nil
+	}
+	m.beginLocalEngine(ctx, settings)
+	return nil
 }
 
 // ListDevices enumerates all audio devices (inputs and outputs) with stable IDs.
@@ -130,8 +189,8 @@ func (m *MeetingService) IsRunning() bool {
 	return m.running
 }
 
-// Start launches a fresh meeting: whisper server, capture, transcription, and a
-// new persisted session.
+// Start launches a fresh meeting using the app's preloaded transcription engine,
+// then starts capture and a new persisted session.
 func (m *MeetingService) Start() error { return m.start(0) }
 
 // Resume continues a previously saved meeting, appending new transcript/analysis
@@ -150,44 +209,30 @@ func (m *MeetingService) start(resumeID int64) error {
 
 	settings, _ := m.store.GetSettings()
 
-	// Transcription endpoint: a configured remote whisper server, or the bundled
-	// local engine launched as a subprocess.
+	// Transcription endpoint: a configured compatible server, or a supervised
+	// local engine. NVIDIA systems prefer the optional Nemotron installation;
+	// bundled CPU Whisper remains the always-available fallback.
 	var sttURL string
+	streamingSTT := false
 	if remote := strings.TrimSpace(settings.SttBaseURL); remote != "" {
 		log.Printf("[stt] using remote transcription server: %s", remote)
 		sttURL = strings.TrimRight(remote, "/")
 	} else {
-		binPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
+		local, err := m.waitLocalEngine(context.Background(), settings)
 		if err != nil {
-			return m.fail("The local transcription engine isn't installed. Run \"task setup:whisper\" (or scripts/setup-whisper.ps1) to fetch it, or set a remote transcription URL in Settings.", err)
+			return m.fail("The local transcription engine couldn't start. Ensure the bundled CPU model is installed, or configure a remote transcription URL in Settings.", err)
 		}
-		modelName := settings.WhisperModel
-		if modelName == "" {
-			modelName = "ggml-small.en-q5_1.bin"
-		}
-		modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
-		if err != nil {
-			// The configured filename isn't present — commonly because the default
-			// model changed but a stale name is still saved in Settings, or a
-			// differently-named file was downloaded. Rather than hard-fail, fall
-			// back to whatever model IS installed so the app keeps working.
-			if alt, altName, ok := anyInstalledModel(); ok {
-				log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
-				modelPath = alt
-			} else {
-				return m.fail(fmt.Sprintf("Transcription model %q is missing and no model is installed under resources/whisper/models. Run scripts/setup-whisper.ps1 to fetch one, pick another in Settings, or use a remote URL.", modelName), err)
-			}
-		}
-
-		m.server = stt.NewServer(binPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log"))
-		if err := m.server.Start(context.Background()); err != nil {
-			return m.fail("The transcription engine didn't start. See the log file for details.", err)
-		}
-		sttURL = m.server.URL()
+		sttURL = local.server.URL()
+		streamingSTT = local.streaming
+		log.Printf("[stt] using preloaded %s", local.name)
 	}
 
 	client := stt.NewClient(sttURL)
-	m.chunker = stt.NewChunker(client, chunkWindow, m.onSegment)
+	if streamingSTT {
+		m.chunker = stt.NewStreamingChunker(client, streamChunkWindow, m.onSegment)
+	} else {
+		m.chunker = stt.NewChunker(client, chunkWindow, m.onSegment)
+	}
 	m.chunker.Start()
 
 	m.openSession(resumeID)
@@ -200,7 +245,6 @@ func (m *MeetingService) start(resumeID int64) error {
 	})
 	if err != nil {
 		m.chunker.Stop()
-		m.stopServer()
 		m.closeSession()
 		return m.fail("Couldn't access the audio system on this machine.", err)
 	}
@@ -211,7 +255,6 @@ func (m *MeetingService) start(resumeID int64) error {
 			m.engine.Stop()
 			m.engine = nil
 		}
-		m.stopServer()
 		m.closeSession()
 		return m.fail("Couldn't start the selected audio device(s). Pick different sources in Audio settings.", err)
 	}
@@ -221,11 +264,176 @@ func (m *MeetingService) start(resumeID int64) error {
 	return nil
 }
 
-// stopServer stops the local whisper subprocess if one was launched.
-func (m *MeetingService) stopServer() {
-	if m.server != nil {
-		m.server.Stop()
-		m.server = nil
+// newNemotronServer resolves the optional install written by resources/nemotron/setup.ps1.
+// The .ready marker is deliberately required so an interrupted installer download
+// is never mistaken for a usable model installation.
+func newNemotronServer() (*stt.Server, error) {
+	ready, err := resolveResource(filepath.Join("resources", "nemotron", ".ready"))
+	if err != nil {
+		return nil, err
+	}
+	python, err := resolveResource(filepath.Join("resources", "nemotron", "runtime", "Scripts", "python.exe"))
+	if err != nil {
+		return nil, err
+	}
+	script, err := resolveResource(filepath.Join("resources", "nemotron", "server.py"))
+	if err != nil {
+		return nil, err
+	}
+	modelDir, err := resolveResource(filepath.Join("resources", "nemotron", "model"))
+	if err != nil {
+		return nil, err
+	}
+	config := filepath.Join(modelDir, "config.json")
+	weights := filepath.Join(modelDir, "model.safetensors")
+	args := []string{
+		script,
+		"--model", modelDir,
+		"--host", whisperHost,
+		"--port", fmt.Sprintf("%d", whisperPort),
+		"--language", "en-US",
+	}
+	return stt.NewCommandServer(
+		"Nemotron 3.5 ASR",
+		python,
+		args,
+		[]string{ready, python, script, config, weights},
+		whisperHost,
+		whisperPort,
+		filepath.Join(dataDir(), "nemotron-server.log"),
+		3*time.Minute,
+	), nil
+}
+
+// newCPUWhisperServer resolves the bundled fallback without starting it.
+func newCPUWhisperServer(settings store.Settings) (*stt.Server, error) {
+	cpuBinPath, err := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve bundled whisper server: %w", err)
+	}
+	modelName := settings.WhisperModel
+	if modelName == "" {
+		modelName = "ggml-small.en-q5_1.bin"
+	}
+	modelPath, err := resolveResource(filepath.Join("resources", "whisper", "models", modelName))
+	if err != nil {
+		// The configured filename isn't present — commonly because the default
+		// model changed but a stale name is still saved in Settings, or a
+		// differently-named file was downloaded. Rather than hard-fail, fall back
+		// to whatever model is installed so the app keeps working.
+		if alt, altName, ok := anyInstalledModel(); ok {
+			log.Printf("[stt] configured model %q not found; falling back to installed model %q", modelName, altName)
+			modelPath = alt
+		} else {
+			return nil, fmt.Errorf("transcription model %q is missing and no fallback model is installed: %w", modelName, err)
+		}
+	}
+	return stt.NewServer(cpuBinPath, modelPath, whisperHost, whisperPort, filepath.Join(dataDir(), "whisper-server.log")), nil
+}
+
+// beginLocalEngine starts one app-lifetime preparation attempt and returns the
+// channel closed when either Nemotron or the CPU fallback is ready (or both have
+// failed). Every caller observes the same result, preventing duplicate model
+// loads when Start is clicked while startup preparation is still running.
+func (m *MeetingService) beginLocalEngine(parent context.Context, settings store.Settings) <-chan struct{} {
+	m.localMu.Lock()
+	if m.localDone != nil {
+		done := m.localDone
+		m.localMu.Unlock()
+		return done
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	m.localDone = done
+	m.localCancel = cancel
+	m.localMu.Unlock()
+
+	go func() {
+		result, err := m.loadLocalEngine(ctx, settings)
+		m.localMu.Lock()
+		m.localResult = result
+		m.localErr = err
+		m.localCancel = nil
+		close(done)
+		m.localMu.Unlock()
+	}()
+	return done
+}
+
+func (m *MeetingService) loadLocalEngine(ctx context.Context, settings store.Settings) (localEngineResult, error) {
+	var nemotronErr error
+	if m.hasNVIDIAGPU() {
+		nemotron, err := m.newNemotron()
+		if err != nil {
+			nemotronErr = err
+			log.Printf("[stt] NVIDIA GPU detected but Nemotron 3.5 ASR is not provisioned: %v", err)
+		} else if err := nemotron.Start(ctx); err != nil {
+			nemotron.Stop()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return localEngineResult{}, ctxErr
+			}
+			nemotronErr = err
+			log.Printf("[stt] Nemotron 3.5 ASR failed to preload (%v); preparing CPU Whisper fallback", err)
+		} else {
+			log.Printf("[stt] Nemotron 3.5 ASR Streaming preloaded on NVIDIA GPU")
+			return localEngineResult{server: nemotron, streaming: true, name: "Nemotron 3.5 ASR Streaming"}, nil
+		}
+	} else {
+		log.Printf("[stt] no available NVIDIA GPU detected; preloading CPU Whisper")
+	}
+	if err := ctx.Err(); err != nil {
+		return localEngineResult{}, err
+	}
+
+	whisper, err := m.newCPUWhisper(settings)
+	if err == nil {
+		err = whisper.Start(ctx)
+	}
+	if err != nil {
+		if whisper != nil {
+			whisper.Stop()
+		}
+		if nemotronErr != nil {
+			return localEngineResult{}, fmt.Errorf("Nemotron: %v; CPU Whisper: %w", nemotronErr, err)
+		}
+		return localEngineResult{}, fmt.Errorf("CPU Whisper: %w", err)
+	}
+	log.Printf("[stt] bundled CPU Whisper fallback preloaded")
+	return localEngineResult{server: whisper, name: "bundled CPU Whisper"}, nil
+}
+
+func (m *MeetingService) waitLocalEngine(ctx context.Context, settings store.Settings) (localEngineResult, error) {
+	done := m.beginLocalEngine(ctx, settings)
+	select {
+	case <-ctx.Done():
+		return localEngineResult{}, ctx.Err()
+	case <-done:
+	}
+	m.localMu.Lock()
+	defer m.localMu.Unlock()
+	return m.localResult, m.localErr
+}
+
+// shutdownLocalEngine cancels an in-progress preload, waits for its goroutine,
+// and releases a successfully prepared app-lifetime server.
+func (m *MeetingService) shutdownLocalEngine() {
+	m.localMu.Lock()
+	cancel := m.localCancel
+	done := m.localDone
+	m.localMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+
+	m.localMu.Lock()
+	server := m.localResult.server
+	m.localResult = localEngineResult{}
+	m.localMu.Unlock()
+	if server != nil {
+		server.Stop()
 	}
 }
 
@@ -277,7 +485,8 @@ func (m *MeetingService) Stop() error {
 	if !m.running {
 		return nil
 	}
-	// Order matters: stop feeds, flush+transcribe remaining audio, then kill server.
+	// Order matters: stop feeds, then flush and transcribe remaining audio. The
+	// preloaded local server stays warm for the next meeting.
 	emitStatus("finalizing", "Finalizing meeting…", nil)
 	if id := m.sessionID.Load(); id != 0 {
 		_ = m.store.SetSessionStatus(id, "finalizing")
@@ -295,8 +504,6 @@ func (m *MeetingService) Stop() error {
 		m.engine.Stop()
 		m.engine = nil
 	}
-	m.stopServer()
-
 	m.recMu.Lock()
 	for _, w := range m.recorders {
 		_ = w.Close()
@@ -313,10 +520,12 @@ func (m *MeetingService) Stop() error {
 
 // ServiceShutdown is called by Wails when the app is exiting. It gives Parley a
 // best-effort chance to stop capture, drain final transcription/analysis, and
-// terminate the local whisper subprocess.
+// terminate the app-lifetime transcription subprocess.
 func (m *MeetingService) ServiceShutdown() error {
 	log.Println("[meeting] service shutdown")
-	return m.Stop()
+	err := m.Stop()
+	m.shutdownLocalEngine()
+	return err
 }
 
 func (m *MeetingService) engineTimeout() time.Duration {
