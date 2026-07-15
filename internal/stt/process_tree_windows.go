@@ -31,16 +31,19 @@ func superviseProcessTree(process *os.Process) (func(), error) {
 		closeJob()
 		return nil, err
 	}
-	var assignErr error
-	if err = process.WithHandle(func(handle uintptr) {
-		assignErr = windows.AssignProcessToJobObject(job, windows.Handle(handle))
-	}); err != nil {
+	processHandle, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		false,
+		uint32(process.Pid),
+	)
+	if err != nil {
 		closeJob()
 		return nil, err
 	}
-	if assignErr != nil {
+	defer windows.CloseHandle(processHandle)
+	if err = windows.AssignProcessToJobObject(job, processHandle); err != nil {
 		closeJob()
-		return nil, assignErr
+		return nil, err
 	}
 	return closeJob, nil
 }
