@@ -70,6 +70,22 @@ func TestMarkdownEmptyState(t *testing.T) {
 	}
 }
 
+func TestMarkdownDerivesSummaryFromTopicOutline(t *testing.T) {
+	state := analysis.State{
+		Past:    []analysis.Topic{{Title: "Authentication", Summary: "JWT issuance was agreed."}},
+		Current: analysis.Topic{Title: "Origins", Points: []string{"Portal access is required.", "Admin access is unresolved."}},
+	}
+	md := Markdown(bundle(t, state))
+	for _, want := range []string{
+		"- **Authentication:** JWT issuance was agreed.",
+		"- **Origins:** Portal access is required. Admin access is unresolved.",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("derived outline summary missing %q:\n%s", want, md)
+		}
+	}
+}
+
 func TestMarkdownPreservesSpecialCharacters(t *testing.T) {
 	state := analysis.State{
 		Summary: "- Discussed R&D, C++, and budget < $5k.",
@@ -86,6 +102,48 @@ func TestMarkdownPreservesSpecialCharacters(t *testing.T) {
 		if !strings.Contains(md, want) {
 			t.Fatalf("markdown missing %q:\n%s", want, md)
 		}
+	}
+}
+
+func TestTranscriptMarkdownIncludesCapturedContextAndEverySegment(t *testing.T) {
+	b := store.SessionBundle{
+		Session: store.Session{Title: "Architecture", StartedAt: "2026-06-24T15:04:05Z"},
+		ContextSnapshot: store.ContextSnapshot{
+			Captured: true,
+			Summary:  "Review authentication design",
+			People:   "Dana; Lee",
+			Notes:    "JWTs are issued by the portal",
+		},
+		Segments: []store.Segment{
+			{Source: "You", Text: "Which origins are allowed?", StartMs: 3_000},
+			{Source: "Others", Text: "Portal and admin.", StartMs: 65_000},
+		},
+		AnalysisJSON: `{"summary":"must not appear"}`,
+		LiveNotes:    []store.LiveNote{{Text: "must not appear either"}},
+	}
+	md := TranscriptMarkdown(b)
+	for _, want := range []string{
+		"## Meeting context", "### Summary / agenda", "Review authentication design",
+		"### People", "Dana; Lee", "### Notes", "JWTs are issued by the portal",
+		"## Transcript", "[00:03] **You:** Which origins are allowed?", "[01:05] **Others:** Portal and admin.",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("transcript markdown missing %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "must not appear") {
+		t.Fatalf("transcript export included analysis or live notes:\n%s", md)
+	}
+}
+
+func TestTranscriptMarkdownDistinguishesNoContextFromLegacySession(t *testing.T) {
+	noContext := TranscriptMarkdown(store.SessionBundle{ContextSnapshot: store.ContextSnapshot{Captured: true}})
+	if !strings.Contains(noContext, "No pre-meeting context was provided") {
+		t.Fatalf("new no-context session message missing:\n%s", noContext)
+	}
+	legacy := TranscriptMarkdown(store.SessionBundle{})
+	if !strings.Contains(legacy, "unavailable for this legacy session") {
+		t.Fatalf("legacy context message missing:\n%s", legacy)
 	}
 }
 

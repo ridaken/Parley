@@ -80,6 +80,25 @@ func TestSessionTitleFallsBackToTimestamp(t *testing.T) {
 	}
 }
 
+func TestAnalysisContextUsesSessionSnapshotInsteadOfActiveProfile(t *testing.T) {
+	s := openMeetingTestStore(t)
+	active, err := s.SaveProfile(store.Profile{Name: "Different", Summary: "new active context"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.CreateSession("Saved", 99, "", store.ContextSnapshot{
+		Summary: "original context", People: "Dana", Notes: "original notes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewMeetingService(s)
+	got := m.analysisContext(id, active.ID)
+	if got.Summary != "original context" || got.People != "Dana" || got.Notes != "original notes" {
+		t.Fatalf("analysis context = %+v", got)
+	}
+}
+
 func TestExportSessionIDFallsBackToLastStoppedMeeting(t *testing.T) {
 	m := NewMeetingService(nil)
 	m.lastSessionID.Store(42)

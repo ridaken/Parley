@@ -39,6 +39,7 @@ import { ContextDialog } from "@/components/ContextDialog";
 import { AudioDialog } from "@/components/AudioDialog";
 import { AudioSourceButton } from "@/components/AudioSourceButton";
 import { SessionsDialog } from "@/components/SessionsDialog";
+import { ExportDialog } from "@/components/ExportDialog";
 import { LiveContextBar, type NoteScope } from "@/components/LiveContextBar";
 import { speakerVariant } from "@/lib/speaker";
 import { normKey } from "@/lib/normalize";
@@ -59,16 +60,15 @@ const STATE_LABEL: Record<string, string> = {
 
 const EMPTY_ANALYSIS: AnalysisState = {
   summary: "",
-  current: { title: "", summary: "", assertions: [] },
+  current: { title: "", summary: "", points: [], assertions: [] },
   past: [],
   suggestions: [],
   actionItems: [],
 };
 
-// How many suggestions / assertions to keep on screen before the oldest drop off
-// the bottom (pinned items lead the list, so they're never trimmed in practice).
+// Safety cap for the current suggestion set. Pinned items lead the list, so they
+// remain visible even if a provider ignores the requested maximum of two.
 const SUGGESTION_CAP = 50;
-const ASSERTION_CAP = 50;
 
 type TextItem = { text: string };
 
@@ -137,7 +137,7 @@ function App() {
   const [analysis, setAnalysis] = useState<AnalysisState>(EMPTY_ANALYSIS);
   const [notes, setNotes] = useState<LiveNote[]>([]);
   const [busy, setBusy] = useState(false);
-  const [exportBusy, setExportBusy] = useState(false);
+  const [exportTarget, setExportTarget] = useState<{ sessionID: number } | null>(null);
   const [uiError, setUiError] = useState("");
   const [hasRecentSession, setHasRecentSession] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -289,26 +289,21 @@ function App() {
     const offAnalysis = Events.On("analysis", (e: { data: AnalysisState }) => {
       const raw = e.data ?? EMPTY_ANALYSIS;
       const title = raw.current?.title ?? "";
-      // Accumulate against the previously displayed lists so suggestions and
-      // assertions persist (newest on top) instead of being replaced each pass.
-      // Assertions belong to the current topic, so they reset on a topic change;
-      // suggestions are meeting-wide and honor pins/dismissals.
-      setAnalysis((prev) => {
-        const topicChanged = title !== (prev.current?.title ?? "");
+      // The backend state is authoritative for assertions. Unpinned suggestions
+      // are intentionally current-pass-only; pinned suggestions remain available
+      // until the user unpins them.
+      setAnalysis(() => {
         return {
           ...raw,
           summary: raw.summary ?? "",
           current: {
             ...raw.current,
-            assertions: accumulateByText(
-              raw.current?.assertions ?? [],
-              topicChanged ? [] : prev.current?.assertions ?? [],
-              { cap: ASSERTION_CAP }
-            ),
+            points: raw.current?.points ?? [],
+            assertions: raw.current?.assertions ?? [],
           },
           suggestions: accumulateByText(
             raw.suggestions ?? [],
-            prev.suggestions ?? [],
+            [],
             { pinned: pinnedRef.current, dismissed: dismissedRef.current, cap: SUGGESTION_CAP }
           ),
           actionItems: raw.actionItems ?? [],
@@ -361,20 +356,6 @@ function App() {
     } catch (err) {
       console.error(err);
       setBusy(false);
-    }
-  };
-
-  const exportMarkdown = async () => {
-    if (!running && !loaded && !hasRecentSession) return;
-    setExportBusy(true);
-    setUiError("");
-    try {
-      await MeetingService.ExportMarkdown(loaded?.id ?? 0);
-    } catch (err) {
-      console.error(err);
-      setUiError(err instanceof Error ? err.message : "Couldn't export meeting notes.");
-    } finally {
-      setExportBusy(false);
     }
   };
 
@@ -458,7 +439,7 @@ function App() {
 
   const startLabel = loaded ? "Resume meeting" : "Start listening";
   const canExport = running || loaded != null || hasRecentSession;
-  const exportDisabled = exportBusy || !canExport;
+  const exportDisabled = !canExport;
   const exportTitle = canExport
     ? "Export meeting notes as Markdown"
     : "Start or open a meeting to export Markdown";
@@ -556,13 +537,9 @@ function App() {
               title={exportTitle}
               aria-label={exportTitle}
               disabled={exportDisabled}
-              onClick={exportMarkdown}
+              onClick={() => setExportTarget({ sessionID: loaded?.id ?? 0 })}
             >
-              {exportBusy ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Download className="h-4 w-4" />
-              )}
+              <Download className="h-4 w-4" />
             </Button>
           </span>
 
@@ -660,16 +637,16 @@ function App() {
         </div>
       )}
 
-      <main className="grid min-h-0 flex-1 grid-cols-[minmax(360px,420px)_1fr] gap-4 p-4">
+      <main className="grid min-h-0 flex-1 grid-cols-[minmax(280px,320px)_minmax(0,1fr)] gap-3 p-3">
         <Card className="min-h-0">
-          <CardHeader>
+          <CardHeader className="px-3 pt-3 pb-2">
             <CardTitle>
               <MessageSquareText className="h-4 w-4 text-primary" />
               Live transcript
             </CardTitle>
           </CardHeader>
           <CardContent className="flex-1 min-h-0 p-0">
-            <ScrollArea className="h-full px-4">
+            <ScrollArea className="h-full px-3">
               {segments.length === 0 ? (
                 <div className="flex h-full items-center justify-center py-16 text-center text-sm text-muted-foreground/60">
                   {running
@@ -677,7 +654,7 @@ function App() {
                     : "Press Start listening to begin."}
                 </div>
               ) : (
-                <div className="flex flex-col gap-3 py-2">
+                <div className="flex flex-col gap-2.5 py-2">
                   {segments.map((seg, i) => (
                     <div key={i} className="flex flex-col gap-1">
                       <div className="flex items-center gap-2">
@@ -698,7 +675,7 @@ function App() {
           </CardContent>
 
           {notes.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 px-4 pb-1 pt-2">
+            <div className="flex flex-wrap gap-1.5 px-3 pb-1 pt-2">
               {notes.map((n, i) => (
                 <Badge
                   key={i}
@@ -752,7 +729,14 @@ function App() {
         onView={viewSession}
         onResume={resumeSession}
         disabled={active}
-        onExport={(id) => MeetingService.ExportMarkdown(id)}
+        onExport={(id) => setExportTarget({ sessionID: id })}
+      />
+      <ExportDialog
+        open={exportTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setExportTarget(null);
+        }}
+        sessionID={exportTarget?.sessionID ?? 0}
       />
     </div>
   );

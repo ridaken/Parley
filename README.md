@@ -58,7 +58,7 @@ flowchart TD
     NOTES["🗒️ Live context notes<br/>(This topic / Whole meeting)"] --> ENG
     PROFILE["📋 Meeting context profile<br/>(summary / people / notes)"] --> ENG
 
-    ENG -->|"every analysis interval<br/>(default 15 s, min 3 s)"| PROMPT["Build prompt:<br/>context + notes + pending transcript"]
+    ENG -->|"after each analysis interval<br/>(default 15 s, min 3 s)"| PROMPT["Build prompt:<br/>context + notes + prior state<br/>12-line overlap + pending transcript"]
     PROMPT -->|"POST /chat/completions<br/>(OpenAI-compatible)"| LLM["LLM endpoint<br/>(local or cloud)"]
     LLM -->|"minified JSON reply"| STATE["State: current topic,<br/>assertions, past topics, suggestions"]
     STATE --> UI2["Analysis panels"]
@@ -71,18 +71,19 @@ Nemotron runtime/model once. Audio and transcription stay local.
 
 ### The analysis interval
 
-A ticker fires every **`analysisIntervalSec`** seconds (Settings → *Analysis
-interval*, default **15 s**, floor **3 s**). On each tick the engine
+After each completed pass, the engine waits **`analysisIntervalSec`** seconds
+(Settings → *Analysis interval*, default **15 s**, floor **3 s**). On each pass
 ([`internal/analysis/engine.go`](internal/analysis/engine.go)):
 
 1. **Skips** the tick if the previous analysis is still in flight, or if no new
    transcript lines have arrived since the last run (no churn on a quiet meeting).
 2. Builds a prompt from transcript lines that arrived since the last successful
-   analysis, plus the prior meeting state, meeting context, and in-effect live
-   notes. The retained rolling transcript is capped at 600 lines.
-3. Sends one **non-streaming** chat completion (`temperature: 0.2`) and parses the
-   reply. The whole transcript buffer is capped at 600 lines, and at most 30 past
-   topics are retained.
+   analysis plus the last 12 processed lines as clearly labelled context. The
+   prior topic outline, recent topics, action items, questions, meeting context,
+   and in-effect live notes are included as structured state.
+3. Sends one **non-streaming** chat completion and parses the reply. Sampling and
+   reasoning mode are left to the configured provider/model. The transcript
+   buffer is capped at 600 lines, and at most 30 past topics are retained.
 
 A shorter interval = fresher insight but more LLM calls; a longer interval is
 cheaper and calmer. Transcription is independent of this: Nemotron advances
@@ -95,8 +96,9 @@ The LLM is asked to return a `topicChanged` boolean alongside the current topic
 title. The engine only **rolls over** a topic when *all* of these hold: the model
 says `topicChanged: true`, there is an existing current topic, and the new title
 actually differs (case-insensitive) from the previous one. On rollover the previous
-topic is archived into **Past topics**, and any **topic-scoped** live notes are
-dropped so a stale correction can't bleed into the next topic.
+topic is archived into the chronological **Discussion outline**, and any
+**topic-scoped** live notes are dropped so a stale correction can't bleed into
+the next topic.
 
 ### HTTP payloads
 
@@ -121,10 +123,9 @@ per capture source, preserving the model's encoder/decoder cache between frames.
 {
   "model": "local-model",
   "messages": [
-    { "role": "system", "content": "You monitor a live meeting transcript… return ONLY a JSON object {currentTopicTitle, currentTopicSummary, topicChanged, assertions[], suggestions[]}" },
-    { "role": "user",   "content": "MEETING CONTEXT … RECENT TRANSCRIPT …" }
+    { "role": "system", "content": "You monitor a live meeting… return ONLY a JSON object {currentTopicTitle, currentTopicSummary, currentTopicPoints[], topicChanged, assertions[], suggestions[], actionItems[]}" },
+    { "role": "user",   "content": "INPUT_JSON: context + prior state + recentTranscriptContext + unprocessedTranscript" }
   ],
-  "temperature": 0.2,
   "stream": false
 }
 ```
@@ -133,7 +134,7 @@ The reply's `choices[0].message.content` is a minified JSON object that becomes 
 analysis State:
 
 ```json
-{"currentTopicTitle":"Q3 pricing","currentTopicSummary":"Debating list price vs. discount floor.","topicChanged":true,"assertions":[{"speaker":"Others","text":"Margin can't drop below 40%."}],"suggestions":[{"kind":"question","text":"What's the volume threshold for the discount?"}]}
+{"currentTopicTitle":"Q3 pricing","currentTopicSummary":"Debating list price vs. discount floor.","currentTopicPoints":["Margin must stay at or above 40%.","Volume discounts are still undefined."],"topicChanged":true,"assertions":[{"speaker":"Others","text":"Margin can't drop below 40%."}],"suggestions":[{"kind":"question","text":"Which volume threshold activates the discount without breaching the 40% margin floor?"}],"actionItems":[]}
 ```
 
 ### How your context reaches the LLM
@@ -142,34 +143,23 @@ Two kinds of user-supplied context are folded into the **user** message every
 analysis tick (see `buildUserPrompt`):
 
 - **Meeting context profile** (notebook icon) — a reusable agenda/attendees/notes
-  block, emitted as a `MEETING CONTEXT` header.
+  block snapshotted with the session and emitted under `meetingContext`.
 - **Live notes** typed during the meeting, by scope:
   - **Whole meeting** → listed under **STANDING CORRECTIONS** (names, acronyms,
     themes); they ride along on *every* subsequent tick for the whole session.
   - **This topic** → listed under **NOTE ON CURRENT TOPIC** and trusted over the
     transcript; they expire automatically when the topic rolls over.
 
-The assembled user prompt looks like:
+The assembled user prompt is escaped JSON data with explicit old/new transcript
+boundaries. A shortened example looks like:
 
-```text
-MEETING CONTEXT
-Summary: Weekly account sync with Acme
-People: Dana (us), Priya (Acme)
-Notes: Renewal due end of quarter
-
-STANDING CORRECTIONS (apply to the whole meeting — e.g. correct names, acronyms, themes):
-- The client is Acme — A-C-M-E
-
-NOTE ON CURRENT TOPIC (corrects the immediate discussion only — trust over the transcript if they conflict):
-- This is about gross margin, not revenue
-
-PREVIOUS TOPIC TITLE: Renewal timeline
-
-RECENT TRANSCRIPT. Speaker labels: "You" = the listener; "Others" = remote participants; "Room" = mixed in-person capture:
-You: so on margin, where do we land?
-Others: we can't go below forty percent…
-
-Return the JSON object now.
+```json
+{
+  "meetingContext": {"summary":"Weekly account sync","people":"Dana; Priya","notes":"Renewal due Q3"},
+  "currentUnderstandingSoFar": {"currentTopicPoints":["Renewal date is unresolved."],"recentTopics":[]},
+  "recentTranscriptContext": "Others: the JWT comes from the portal\n",
+  "unprocessedTranscript": "You: which origins need access?\n"
+}
 ```
 
 > 🔧 **Keep this section current:** if you change the chunk window, the analysis
@@ -347,8 +337,9 @@ Nemotron model or Python/CUDA runtime.
    cloud URL. Mark one **active** (★), **Test** each, and set the analysis interval
    and transcription options. Switch which connection a meeting uses from the
    **LLM connection dropdown in the header** (before you start the meeting).
-4. **Start listening.** The transcript streams on the left; topic / assertions / past
-   topics / suggestions populate on the right.
+4. **Start listening.** The transcript streams on the left; the current topic strip
+   and the discussion outline / assertions / action items / suggested questions
+   workbench update on the right.
 
 ### Live context injection
 
@@ -375,6 +366,10 @@ meetings** (history icon) to:
   meeting, so a conversation can span several sittings.
 
 Audio is recorded per source under your app-data `recordings/session-<id>/` folder.
+
+Use the export button in the header or Saved meetings to choose between polished
+meeting notes and a source-oriented export containing the session's snapshotted
+pre-meeting context followed by every timestamped transcript line.
 
 ---
 

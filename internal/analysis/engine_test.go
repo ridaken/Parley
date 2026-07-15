@@ -80,11 +80,11 @@ func TestParseResultAcceptsStateShapedObject(t *testing.T) {
 	}
 }
 
-func TestBuildUserPromptDisablesThinkingMode(t *testing.T) {
+func TestBuildUserPromptLeavesReasoningModeToProvider(t *testing.T) {
 	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
 	prompt := eng.buildUserPrompt("You: hi\n", priorView{}, nil)
-	if !strings.HasPrefix(prompt, "/no_think\n") {
-		t.Fatalf("user prompt should start with no_think directive:\n%s", prompt)
+	if strings.Contains(strings.ToLower(prompt), "no_think") || strings.Contains(strings.ToLower(systemPrompt), "non-thinking") {
+		t.Fatalf("prompts should not force a reasoning mode:\n%s", prompt)
 	}
 	if !contains(prompt, "Start with { and end with }") {
 		t.Fatalf("user prompt missing JSON boundary instruction:\n%s", prompt)
@@ -877,10 +877,12 @@ func TestCloneStateIncludesSummaryAndCopiesSlices(t *testing.T) {
 func TestBuildUserPromptIncludesUnderstanding(t *testing.T) {
 	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
 	prior := priorView{
-		meetingSummary: "- Budget is over target.",
-		title:          "Budget",
-		summary:        "Discussing Q3 spend.",
-		assertions:     []Assertion{{Speaker: "Others", Text: "we are over budget"}},
+		meetingSummary:   "- Budget is over target.",
+		title:            "Budget",
+		summary:          "Discussing Q3 spend.",
+		points:           []string{"Budget exceeds the target."},
+		assertions:       []Assertion{{Speaker: "Others", Text: "we are over budget"}},
+		recentTranscript: "Others: the cap applies to production only\n",
 		actionItems: []ActionItem{
 			{Text: "Send deck"},
 			{Text: "Approve PO", Owner: "Lee"},
@@ -890,7 +892,9 @@ func TestBuildUserPromptIncludesUnderstanding(t *testing.T) {
 	for _, want := range []string{
 		"INPUT_JSON",
 		`"unprocessedTranscript": "You: hi\n"`,
-		`"meetingSummary": "- Budget is over target."`,
+		`"legacyMeetingSummary": "- Budget is over target."`,
+		`"recentTranscriptContext": "Others: the cap applies to production only\n"`,
+		"Budget exceeds the target.",
 		"Discussing Q3 spend.",
 		`"speaker": "Others"`,
 		`"text": "Send deck"`,
@@ -899,6 +903,26 @@ func TestBuildUserPromptIncludesUnderstanding(t *testing.T) {
 		if !contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestSnapshotAnalysisJobIncludesOnlyBoundedProcessedOverlap(t *testing.T) {
+	eng := NewEngine(nil, 3*time.Second, Context{}, nil)
+	for i := 0; i < 15; i++ {
+		eng.Feed("Others", fmt.Sprintf("processed %d", i))
+	}
+	eng.analyzedLen = 15
+	eng.Feed("You", "new line")
+
+	job, ok := eng.snapshotAnalysisJob()
+	if !ok {
+		t.Fatal("expected analysis job")
+	}
+	if strings.Contains(job.prior.recentTranscript, "processed 0") || !strings.Contains(job.prior.recentTranscript, "processed 3") {
+		t.Fatalf("overlap was not bounded to the last %d lines:\n%s", contextOverlapLines, job.prior.recentTranscript)
+	}
+	if strings.Contains(job.prior.recentTranscript, "new line") || !strings.Contains(job.window, "new line") {
+		t.Fatalf("processed overlap and unprocessed window were not separated: overlap=%q window=%q", job.prior.recentTranscript, job.window)
 	}
 }
 
@@ -942,7 +966,7 @@ func TestStartStopIsClean(t *testing.T) {
 
 func TestEngineArchivesPastTopic(t *testing.T) {
 	replies := []string{
-		`{"currentTopicTitle":"Topic A","meetingSummary":"- Topic A discussed.","topicChanged":false,"assertions":[],"suggestions":[]}`,
+		`{"currentTopicTitle":"Topic A","currentTopicSummary":"First topic","currentTopicPoints":["Point A"],"meetingSummary":"- Topic A discussed.","topicChanged":false,"assertions":[],"suggestions":[]}`,
 		`{"currentTopicTitle":"Topic B","meetingSummary":"- Topic A discussed.\n- Topic B discussed.","topicChanged":true,"assertions":[],"suggestions":[]}`,
 	}
 	var idx int
@@ -970,5 +994,8 @@ func TestEngineArchivesPastTopic(t *testing.T) {
 	}
 	if len(s.Past) != 1 || s.Past[0].Title != "Topic A" {
 		t.Fatalf("past = %+v", s.Past)
+	}
+	if len(s.Past[0].Points) != 1 || s.Past[0].Points[0] != "Point A" || len(s.Current.Points) != 0 || s.Current.Summary != "" {
+		t.Fatalf("topic rollover carried or lost details incorrectly: current=%+v past=%+v", s.Current, s.Past)
 	}
 }

@@ -39,7 +39,7 @@ const DEFAULTS: Settings = {
   llmBaseURL: "http://127.0.0.1:8080/v1",
   llmModel: "local-model",
   analysisIntervalSec: 15,
-  analysisTimeoutSec: 30,
+  analysisTimeoutSec: 60,
   loggingLevel: "trace",
   activeProfileID: 0,
   hasAPIKey: false,
@@ -346,7 +346,7 @@ export function SettingsDialog({
                 min={5}
                 value={settings.analysisTimeoutSec}
                 onChange={(e) =>
-                  setSettings({ ...settings, analysisTimeoutSec: Number(e.target.value) || 30 })
+                  setSettings({ ...settings, analysisTimeoutSec: Number(e.target.value) || 60 })
                 }
               />
             </div>

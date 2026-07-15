@@ -56,5 +56,6 @@ export interface Suggestion {
 export interface Topic {
     "title": string;
     "summary": string;
+    "points": string[] | null;
     "assertions": Assertion[] | null;
 }

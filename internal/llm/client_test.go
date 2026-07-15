@@ -51,6 +51,9 @@ func TestCompleteDoesNotImposeMaxTokens(t *testing.T) {
 		if _, ok := req["max_tokens"]; ok {
 			t.Fatalf("request should let the provider choose its completion limit: %+v", req)
 		}
+		if _, ok := req["temperature"]; ok {
+			t.Fatalf("request should let the provider choose its sampling defaults: %+v", req)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{"message": map[string]any{"content": "pong"}, "finish_reason": "stop"}},
 		})

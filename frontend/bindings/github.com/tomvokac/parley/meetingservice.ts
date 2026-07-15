@@ -46,6 +46,15 @@ export function ExportMarkdown(sessionID: number): $CancellablePromise<string> {
 }
 
 /**
+ * ExportTranscriptMarkdown saves the exact pre-meeting context snapshot followed
+ * by the complete persisted transcript. It intentionally excludes analysis and
+ * live notes.
+ */
+export function ExportTranscriptMarkdown(sessionID: number): $CancellablePromise<string> {
+    return $Call.ByID(1564234185, sessionID);
+}
+
+/**
  * GetRuntimeInfo reports the exact app version and the transcription model that
  * has actually been selected. In particular, this reflects a CPU fallback when
  * Nemotron was preferred but could not start, rather than merely echoing the
