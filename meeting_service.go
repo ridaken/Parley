@@ -323,22 +323,15 @@ func (m *MeetingService) start(resumeID int64) error {
 // The .ready marker is deliberately required so an interrupted installer download
 // is never mistaken for a usable model installation.
 func newNemotronServer() (*stt.Server, error) {
-	ready, err := resolveResource(filepath.Join("resources", "nemotron", ".ready"))
+	install, err := resolveNemotronInstall()
 	if err != nil {
 		return nil, err
 	}
-	python, err := resolveResource(filepath.Join("resources", "nemotron", "runtime", "Scripts", "python.exe"))
-	if err != nil {
-		return nil, err
-	}
-	script, err := resolveResource(filepath.Join("resources", "nemotron", "server.py"))
-	if err != nil {
-		return nil, err
-	}
-	modelDir, err := resolveResource(filepath.Join("resources", "nemotron", "model"))
-	if err != nil {
-		return nil, err
-	}
+	root := install.root
+	ready := filepath.Join(root, ".ready")
+	python := filepath.Join(root, "runtime", "Scripts", "python.exe")
+	script := install.script
+	modelDir := filepath.Join(root, "model")
 	config := filepath.Join(modelDir, "config.json")
 	weights := filepath.Join(modelDir, "model.safetensors")
 	args := []string{
