@@ -441,8 +441,8 @@ function App() {
   const canExport = running || loaded != null || hasRecentSession;
   const exportDisabled = !canExport;
   const exportTitle = canExport
-    ? "Export meeting notes as Markdown"
-    : "Start or open a meeting to export Markdown";
+    ? "Export meeting (notes or context + transcript)"
+    : "Start or open a meeting to export";
 
   return (
     <div className="flex h-screen flex-col">
