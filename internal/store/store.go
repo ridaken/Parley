@@ -175,13 +175,16 @@ CREATE TABLE IF NOT EXISTS llm_connections (
 	if err := s.addColumn("settings", "active_llm_connection_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	if err := s.addColumn("settings", "analysis_timeout_sec", "INTEGER NOT NULL DEFAULT 30"); err != nil {
+	if err := s.addColumn("settings", "analysis_timeout_sec", "INTEGER NOT NULL DEFAULT 60"); err != nil {
 		return err
 	}
 	if err := s.addColumn("settings", "logging_level", "TEXT NOT NULL DEFAULT 'trace'"); err != nil {
 		return err
 	}
 	if err := s.addColumn("sessions", "status", "TEXT NOT NULL DEFAULT 'complete'"); err != nil {
+		return err
+	}
+	if err := s.addColumn("sessions", "context_snapshot_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return s.seedLLMConnections()
@@ -245,7 +248,7 @@ func (s *Store) GetSettings() (Settings, error) {
 		st.AnalysisIntervalSec = 15
 	}
 	if st.AnalysisTimeoutSec <= 0 {
-		st.AnalysisTimeoutSec = 30
+		st.AnalysisTimeoutSec = 60
 	}
 	if st.WhisperModel == "" {
 		st.WhisperModel = "ggml-small.en-q5_1.bin"

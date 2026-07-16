@@ -5,7 +5,7 @@ import "testing"
 func TestSessionSettersAndGetProfile(t *testing.T) {
 	s := openTemp(t)
 
-	id, err := s.CreateSession("Initial", 0, "")
+	id, err := s.CreateSession("Initial", 0, "", ContextSnapshot{})
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestSessionSettersAndGetProfile(t *testing.T) {
 func TestSessionRoundTrip(t *testing.T) {
 	s := openTemp(t)
 
-	id, err := s.CreateSession("Standup", 0, "/tmp/audio")
+	id, err := s.CreateSession("Standup", 0, "/tmp/audio", ContextSnapshot{Summary: "Daily team sync", People: "Dana"})
 	if err != nil || id == 0 {
 		t.Fatalf("CreateSession: id=%d err=%v", id, err)
 	}
@@ -92,6 +92,9 @@ func TestSessionRoundTrip(t *testing.T) {
 	}
 	if bundle.Session.Status != "complete" {
 		t.Fatalf("session status after EndSession = %q", bundle.Session.Status)
+	}
+	if !bundle.ContextSnapshot.Captured || bundle.ContextSnapshot.Summary != "Daily team sync" || bundle.ContextSnapshot.People != "Dana" {
+		t.Fatalf("context snapshot = %+v", bundle.ContextSnapshot)
 	}
 
 	list, err := s.ListSessions()

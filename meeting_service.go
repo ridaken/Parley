@@ -590,7 +590,7 @@ func (m *MeetingService) ServiceShutdown() error {
 func (m *MeetingService) engineTimeout() time.Duration {
 	settings, err := m.store.GetSettings()
 	if err != nil || settings.AnalysisTimeoutSec <= 0 {
-		return 30 * time.Second
+		return 60 * time.Second
 	}
 	return time.Duration(settings.AnalysisTimeoutSec) * time.Second
 }
@@ -614,7 +614,13 @@ func (m *MeetingService) openSession(resumeID int64) {
 	sessionID := resumeID
 	if sessionID == 0 {
 		title := sessionTitle(profile, hasProfile, time.Now())
-		id, err := m.store.CreateSession(title, profileID, "")
+		snapshot := store.ContextSnapshot{}
+		if hasProfile {
+			snapshot = store.ContextSnapshot{
+				Name: profile.Name, Summary: profile.Summary, People: profile.People, Notes: profile.Notes,
+			}
+		}
+		id, err := m.store.CreateSession(title, profileID, "", snapshot)
 		if err != nil {
 			log.Printf("[session] could not create session: %v", err)
 		}
@@ -706,10 +712,9 @@ func (m *MeetingService) onSegment(seg stt.Segment) {
 	}
 }
 
-// startEngine sets up the LLM analysis engine from current settings + the active
-// context profile. If no endpoint is configured, analysis is skipped (transcript
-// still works). When resumeID != 0 it rehydrates the saved analysis state so the
-// continued meeting builds on prior topics/assertions.
+// startEngine sets up the LLM analysis engine using the context snapshotted with
+// this session. Legacy sessions fall back to their saved profile id. If no
+// endpoint is configured, analysis is skipped (transcript still works).
 func (m *MeetingService) startEngine(resumeID int64) {
 	settings, err := m.store.GetSettings()
 	if err != nil {
@@ -724,20 +729,14 @@ func (m *MeetingService) startEngine(resumeID int64) {
 		return
 	}
 
-	var bg analysis.Context
-	if settings.ActiveProfileID != 0 {
-		if p, err := m.store.GetProfile(settings.ActiveProfileID); err == nil {
-			bg = analysis.Context{Summary: p.Summary, People: p.People, Notes: p.Notes}
-		}
-	}
+	sessionID := m.sessionID.Load()
+	bg := m.analysisContext(sessionID, settings.ActiveProfileID)
 
 	apiKey, _ := m.store.GetConnectionAPIKey(conn.ID)
 	log.Printf("[analysis] using LLM connection %q (%s, model %s)", conn.Name, conn.BaseURL, conn.Model)
 	client := llm.NewClient(conn.BaseURL, apiKey, conn.Model)
 	delay := time.Duration(settings.AnalysisIntervalSec) * time.Second
 	timeout := time.Duration(settings.AnalysisTimeoutSec) * time.Second
-	sessionID := m.sessionID.Load()
-
 	m.engine = analysis.NewEngineWithTimeout(client, delay, timeout, bg, func(s analysis.State) {
 		emitAnalysisStatus("ok", "")
 		application.Get().Event.Emit("analysis", s)
@@ -769,6 +768,28 @@ func (m *MeetingService) startEngine(resumeID int64) {
 		application.Get().Event.Emit("analysis", analysis.State{}) // clear previous session
 	}
 	m.engine.Start()
+}
+
+func (m *MeetingService) analysisContext(sessionID, activeProfileID int64) analysis.Context {
+	profileID := activeProfileID
+	if sessionID != 0 {
+		if b, err := m.store.GetSessionBundle(sessionID); err == nil {
+			if b.ContextSnapshot.Captured {
+				return analysis.Context{
+					Summary: b.ContextSnapshot.Summary,
+					People:  b.ContextSnapshot.People,
+					Notes:   b.ContextSnapshot.Notes,
+				}
+			}
+			profileID = b.Session.ProfileID
+		}
+	}
+	if profileID != 0 {
+		if p, err := m.store.GetProfile(profileID); err == nil {
+			return analysis.Context{Summary: p.Summary, People: p.People, Notes: p.Notes}
+		}
+	}
+	return analysis.Context{}
 }
 
 // restoreEngine seeds the engine from a saved session and re-emits its analysis
@@ -854,6 +875,17 @@ func (m *MeetingService) LoadSession(id int64) (LoadedSession, error) {
 // ExportMarkdown saves the active or selected meeting's notes as a Markdown file.
 // Pass sessionID=0 to export the currently running session.
 func (m *MeetingService) ExportMarkdown(sessionID int64) (string, error) {
+	return m.exportMarkdownFile(sessionID, "Export meeting notes", "", meetingexport.Markdown)
+}
+
+// ExportTranscriptMarkdown saves the exact pre-meeting context snapshot followed
+// by the complete persisted transcript. It intentionally excludes analysis and
+// live notes.
+func (m *MeetingService) ExportTranscriptMarkdown(sessionID int64) (string, error) {
+	return m.exportMarkdownFile(sessionID, "Export context and transcript", "-transcript", meetingexport.TranscriptMarkdown)
+}
+
+func (m *MeetingService) exportMarkdownFile(sessionID int64, dialogTitle, filenameSuffix string, render func(store.SessionBundle) string) (string, error) {
 	sessionID = m.exportSessionID(sessionID)
 	if sessionID == 0 {
 		return "", fmt.Errorf("no meeting is available to export")
@@ -869,6 +901,11 @@ func (m *MeetingService) ExportMarkdown(sessionID int64) (string, error) {
 	if filename == "" {
 		filename = fmt.Sprintf("meeting-%d", sessionID)
 	}
+	hasExt := strings.HasSuffix(strings.ToLower(filename), ".md")
+	if hasExt {
+		filename = filename[:len(filename)-3]
+	}
+	filename += filenameSuffix
 	if !strings.HasSuffix(strings.ToLower(filename), ".md") {
 		filename += ".md"
 	}
@@ -877,7 +914,7 @@ func (m *MeetingService) ExportMarkdown(sessionID int64) (string, error) {
 		return "", fmt.Errorf("export requires the Wails application runtime")
 	}
 	path, err := app.Dialog.SaveFileWithOptions(&application.SaveFileDialogOptions{
-		Title:    "Export meeting notes",
+		Title:    dialogTitle,
 		Filename: filename,
 		Filters: []application.FileFilter{
 			{DisplayName: "Markdown", Pattern: "*.md"},
@@ -889,7 +926,7 @@ func (m *MeetingService) ExportMarkdown(sessionID int64) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", nil
 	}
-	if err := os.WriteFile(path, []byte(meetingexport.Markdown(b)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(render(b)), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil

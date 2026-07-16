@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
@@ -25,6 +26,17 @@ type LiveNote struct {
 	CreatedAt  string `json:"createdAt"`
 }
 
+// ContextSnapshot is the exact reusable context selected when a session was
+// created. Captured distinguishes a new session with no selected context from a
+// legacy session created before snapshots existed.
+type ContextSnapshot struct {
+	Captured bool   `json:"captured"`
+	Name     string `json:"name"`
+	Summary  string `json:"summary"`
+	People   string `json:"people"`
+	Notes    string `json:"notes"`
+}
+
 // Session is a (possibly multi-part) recorded meeting.
 type Session struct {
 	ID           int64  `json:"id"`
@@ -41,18 +53,24 @@ type Session struct {
 // AnalysisJSON is the analysis.State serialised as JSON; the caller (which knows
 // that type) unmarshals it, keeping this package free of the analysis import.
 type SessionBundle struct {
-	Session      Session    `json:"session"`
-	Segments     []Segment  `json:"segments"`
-	AnalysisJSON string     `json:"analysisJSON"`
-	LiveNotes    []LiveNote `json:"liveNotes"`
+	Session         Session         `json:"session"`
+	Segments        []Segment       `json:"segments"`
+	AnalysisJSON    string          `json:"analysisJSON"`
+	LiveNotes       []LiveNote      `json:"liveNotes"`
+	ContextSnapshot ContextSnapshot `json:"contextSnapshot"`
 }
 
 // CreateSession inserts a new session row and returns its id.
-func (s *Store) CreateSession(title string, profileID int64, audioDir string) (int64, error) {
+func (s *Store) CreateSession(title string, profileID int64, audioDir string, snapshot ContextSnapshot) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	snapshot.Captured = true
+	snapshotJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		return 0, err
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO sessions (title, started_at, profile_id, audio_dir, status) VALUES (?, ?, ?, ?, ?)`,
-		title, now, profileID, audioDir, "recording",
+		`INSERT INTO sessions (title, started_at, profile_id, audio_dir, status, context_snapshot_json) VALUES (?, ?, ?, ?, ?, ?)`,
+		title, now, profileID, audioDir, "recording", string(snapshotJSON),
 	)
 	if err != nil {
 		return 0, err
@@ -151,11 +169,15 @@ ORDER BY s.started_at DESC`)
 // GetSessionBundle loads a session's full state (segments, analysis, live notes).
 func (s *Store) GetSessionBundle(id int64) (SessionBundle, error) {
 	var b SessionBundle
+	var snapshotJSON string
 	row := s.db.QueryRow(
-		`SELECT id, title, started_at, ended_at, status, profile_id, audio_dir, analysis_json FROM sessions WHERE id = ?`, id)
+		`SELECT id, title, started_at, ended_at, status, profile_id, audio_dir, analysis_json, context_snapshot_json FROM sessions WHERE id = ?`, id)
 	if err := row.Scan(&b.Session.ID, &b.Session.Title, &b.Session.StartedAt, &b.Session.EndedAt,
-		&b.Session.Status, &b.Session.ProfileID, &b.Session.AudioDir, &b.AnalysisJSON); err != nil {
+		&b.Session.Status, &b.Session.ProfileID, &b.Session.AudioDir, &b.AnalysisJSON, &snapshotJSON); err != nil {
 		return SessionBundle{}, err
+	}
+	if snapshotJSON != "" {
+		_ = json.Unmarshal([]byte(snapshotJSON), &b.ContextSnapshot)
 	}
 
 	segs, err := s.segments(id)

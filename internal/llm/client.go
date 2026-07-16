@@ -44,7 +44,6 @@ func NewClient(baseURL, apiKey, model string) *Client {
 type chatRequest struct {
 	Model          string          `json:"model"`
 	Messages       []Message       `json:"messages"`
-	Temperature    float64         `json:"temperature"`
 	Stream         bool            `json:"stream"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 }
@@ -176,10 +175,9 @@ func (c *Client) complete(ctx context.Context, messages []Message, jsonMode bool
 	start := time.Now()
 	url := c.baseURL + "/chat/completions"
 	reqBody := chatRequest{
-		Model:       c.model,
-		Messages:    messages,
-		Temperature: 0.2,
-		Stream:      false,
+		Model:    c.model,
+		Messages: messages,
+		Stream:   false,
 	}
 	if jsonMode {
 		reqBody.ResponseFormat = &responseFormat{Type: "json_object"}
