@@ -109,8 +109,8 @@ export interface Settings {
     "captureSources": CaptureSource[] | null;
 
     /**
-     * SttBaseURL, when set, points transcription at a remote whisper.cpp-compatible
-     * server (e.g. http://host:8765) instead of launching the bundled engine.
+     * SttBaseURL, when set, points transcription at a remote /inference-compatible
+     * server (e.g. http://host:8765) instead of launching a local engine.
      */
     "sttBaseURL": string;
 

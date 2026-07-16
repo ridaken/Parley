@@ -35,6 +35,44 @@ Unicode true
 ####
 !include "wails_tools.nsh"
 
+# Wails' generated uninstaller macro calculates EstimatedSize by recursively
+# scanning all of $INSTDIR. Older Parley releases stored the optional Nemotron
+# model/runtime there, so an upgrade can spend minutes enumerating tens of
+# thousands of persistent files after the application is already installed.
+# Register the same uninstall metadata, but estimate only the shipped payload:
+# the executable plus bundled CPU Whisper resources. Nemotron is provisioned
+# and reused independently and must never make an application upgrade stall.
+!macro parley.writeUninstaller
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+
+    ${GetSize} "$INSTDIR\resources\whisper" "/S=0K" $0 $1 $2
+    FileOpen $1 "$INSTDIR\${PRODUCT_EXECUTABLE}" r
+    FileSeek $1 0 END $2
+    FileClose $1
+    IntOp $2 $2 + 1023
+    IntOp $2 $2 / 1024
+    IntOp $0 $0 + $2
+
+    SetRegView 64
+    !if "${WAILS_INSTALL_SCOPE}" == "user"
+        WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
+        WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
+        WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
+        WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+        WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+        WriteRegStr HKCU "${UNINST_KEY}" "QuietUninstallString" "$\"$INSTDIR\uninstall.exe$\" /S"
+        WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" "$0"
+    !else
+        WriteRegStr HKLM "${UNINST_KEY}" "Publisher" "${INFO_COMPANYNAME}"
+        WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "${INFO_PRODUCTNAME}"
+        WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
+        WriteRegStr HKLM "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+        WriteRegStr HKLM "${UNINST_KEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+        WriteRegStr HKLM "${UNINST_KEY}" "QuietUninstallString" "$\"$INSTDIR\uninstall.exe$\" /S"
+        WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
+    !endif
+!macroend
+
 # The version information for this two must consist of 4 parts
 VIProductVersion "${INFO_PRODUCTVERSION}.0"
 VIFileVersion    "${INFO_PRODUCTVERSION}.0"
@@ -193,7 +231,7 @@ Section
     !insertmacro wails.associateFiles
     !insertmacro wails.associateCustomProtocols
 
-    !insertmacro wails.writeUninstaller
+    !insertmacro parley.writeUninstaller
 
     # Record where we installed so a future update can find and overwrite this copy.
     SetRegView 64

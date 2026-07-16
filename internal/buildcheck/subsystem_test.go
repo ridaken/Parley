@@ -67,6 +67,34 @@ func TestInstallerOffersMissingNemotronOnUpgrade(t *testing.T) {
 	}
 }
 
+// Upgrade bookkeeping must not recursively scan the full installation tree.
+// Legacy releases stored the optional multi-GB Nemotron runtime under INSTDIR;
+// Wails' generated writeUninstaller macro therefore made otherwise-complete
+// upgrades appear to grow indefinitely while its GetSize call enumerated it.
+func TestInstallerSizeEstimateExcludesPersistentNemotron(t *testing.T) {
+	path := filepath.Join("..", "..", "build", "windows", "nsis", "project.nsi")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	installer := string(data)
+	for _, required := range []string{
+		`!macro parley.writeUninstaller`,
+		`${GetSize} "$INSTDIR\resources\whisper"`,
+		`!insertmacro parley.writeUninstaller`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("%s no longer contains %q; upgrade size bookkeeping may include persistent Nemotron data", path, required)
+		}
+	}
+	if strings.Contains(installer, `!insertmacro wails.writeUninstaller`) {
+		t.Fatalf("%s calls Wails' generated uninstaller macro, which recursively scans all of INSTDIR", path)
+	}
+	if strings.Contains(installer, `${GetSize} "$INSTDIR"`) {
+		t.Fatalf("%s recursively scans all of INSTDIR while registering EstimatedSize", path)
+	}
+}
+
 func TestNemotronSetupUsesPrivatePythonAndSharedStorage(t *testing.T) {
 	path := filepath.Join("..", "..", "resources", "nemotron", "setup.ps1")
 	data, err := os.ReadFile(path)
