@@ -908,6 +908,10 @@ func (m *MeetingService) exportMarkdownFile(sessionID int64, dialogTitle, filena
 	if filename == "" {
 		filename = fmt.Sprintf("meeting-%d", sessionID)
 	}
+	hasExt := strings.HasSuffix(strings.ToLower(filename), ".md")
+	if hasExt {
+		filename = filename[:len(filename)-3]
+	}
 	filename += filenameSuffix
 	if !strings.HasSuffix(strings.ToLower(filename), ".md") {
 		filename += ".md"
