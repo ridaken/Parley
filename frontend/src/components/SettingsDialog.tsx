@@ -143,20 +143,24 @@ export function SettingsDialog({
     setModelAction("");
     setModelMessage("");
     setModelTestOK(false);
-    Promise.all([LibraryService.GetSettings(), MeetingService.ListTranscriptionModels()])
-      .then(([s, models]) => {
+    setTranscriptionModels([]);
+    LibraryService.GetSettings()
+      .then((s) => {
         const loaded = s ?? DEFAULTS;
         setSettings(loaded);
         setSavedTranscription({
           modelID: transcriptionModelID(loaded),
           externalURL: loaded.sttBaseURL.trim().replace(/\/+$/, ""),
         });
-        setTranscriptionModels(models ?? []);
       })
       .catch(() => {
         setSettings(DEFAULTS);
-        setTranscriptionModels([]);
+        setSavedTranscription({ modelID: "auto", externalURL: "" });
       });
+
+    MeetingService.ListTranscriptionModels()
+      .then((models) => setTranscriptionModels(models ?? []))
+      .catch(() => setTranscriptionModels([]));
     loadConns().catch(() => setConns([]));
   }, [open]);
 
