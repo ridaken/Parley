@@ -10,8 +10,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = $PSScriptRoot,
-    [string]$UvVersion = "0.11.28"
+    [string]$InstallRoot = "",
+    [string]$UvVersion = "0.11.28",
+    [switch]$DiscoverExisting,
+    [switch]$ReuseOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,23 +30,141 @@ function Invoke-Checked {
     }
 }
 
+function Test-CompleteNemotronInstall {
+    param([string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $false }
+    foreach ($relativePath in @(
+        ".ready",
+        "runtime/Scripts/python.exe",
+        "model/config.json",
+        "model/model.safetensors",
+        "server.py"
+    )) {
+        if (-not (Test-Path (Join-Path $Root $relativePath))) { return $false }
+    }
+    return $true
+}
+
+function Write-SourceRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetRoot,
+        [Parameter(Mandatory = $true)][string]$SourceRoot
+    )
+    New-Item -ItemType Directory -Force -Path $TargetRoot | Out-Null
+    $marker = Join-Path $TargetRoot ".source-root"
+    [System.IO.File]::WriteAllText(
+        $marker,
+        [System.IO.Path]::GetFullPath($SourceRoot),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function Find-ExistingNemotronInstall {
+    param(
+        [string]$TargetRoot,
+        [switch]$SearchUserRepositories
+    )
+
+    $directCandidates = @($env:PARLEY_NEMOTRON_HOME, $PSScriptRoot)
+    foreach ($candidate in $directCandidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $candidate = [System.IO.Path]::GetFullPath($candidate)
+        if ($candidate -ne $TargetRoot -and (Test-CompleteNemotronInstall $candidate)) {
+            return $candidate
+        }
+    }
+    if (-not $SearchUserRepositories -or [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        return $null
+    }
+
+    # Older development builds provisioned directly inside a checkout. Search
+    # common repository locations once during interactive installer setup so a
+    # valid multi-GB model can be reused in place instead of downloaded again.
+    $searchRoots = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @(
+        (Join-Path $env:USERPROFILE "source/repos"),
+        (Join-Path $env:USERPROFILE "Documents")
+    )) {
+        if (Test-Path $path) { $searchRoots.Add($path) }
+    }
+    Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter "OneDrive*" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $documents = Join-Path $_.FullName "Documents"
+            if (Test-Path $documents) { $searchRoots.Add($documents) }
+        }
+
+    $seen = @{}
+    foreach ($searchRoot in $searchRoots) {
+        $fullSearchRoot = [System.IO.Path]::GetFullPath($searchRoot)
+        if ($seen.ContainsKey($fullSearchRoot)) { continue }
+        $seen[$fullSearchRoot] = $true
+        Write-Host "Checking $fullSearchRoot for an existing Nemotron installation..."
+        foreach ($marker in Get-ChildItem -LiteralPath $fullSearchRoot -File -Filter ".ready" -Recurse -Force -ErrorAction SilentlyContinue) {
+            $candidate = $marker.Directory.FullName
+            if ($candidate -ne $TargetRoot -and (Test-CompleteNemotronInstall $candidate)) {
+                return $candidate
+            }
+        }
+    }
+    return $null
+}
+
+if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $InstallRoot = Join-Path $env:LOCALAPPDATA "Parley/nemotron"
+    }
+    else {
+        $InstallRoot = $PSScriptRoot
+    }
+}
+
 $InstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
 $readyMarker = Join-Path $InstallRoot ".ready"
+$sourceRootMarker = Join-Path $InstallRoot ".source-root"
 $venvDir = Join-Path $InstallRoot "runtime"
 $pythonExe = Join-Path $venvDir "Scripts/python.exe"
 $modelDir = Join-Path $InstallRoot "model"
 $toolsDir = Join-Path $InstallRoot "tools"
 $uvExe = Join-Path $toolsDir "uv.exe"
 
-if ((Test-Path $readyMarker) -and (Test-Path $pythonExe) -and (Test-Path (Join-Path $modelDir "model.safetensors"))) {
+New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+foreach ($supportFile in @("download_model.py", "server.py", "validate_install.py")) {
+    $source = Join-Path $PSScriptRoot $supportFile
+    $destination = Join-Path $InstallRoot $supportFile
+    if ((Test-Path $source) -and ([System.IO.Path]::GetFullPath($source) -ne [System.IO.Path]::GetFullPath($destination))) {
+        Copy-Item $source $destination -Force
+    }
+}
+
+if (Test-CompleteNemotronInstall $InstallRoot) {
     Write-Host "Nemotron 3.5 ASR is already provisioned; keeping the existing installation."
-    exit 0
+    return
+}
+
+if (Test-Path $sourceRootMarker) {
+    $sourceRoot = (Get-Content $sourceRootMarker -Raw).Trim().TrimStart([char]0xFEFF)
+    if (Test-CompleteNemotronInstall $sourceRoot) {
+        Write-Host "Nemotron 3.5 ASR is already provisioned at $sourceRoot; reusing it."
+        return
+    }
+    Remove-Item $sourceRootMarker -Force -ErrorAction SilentlyContinue
+}
+
+$existingRoot = Find-ExistingNemotronInstall -TargetRoot $InstallRoot -SearchUserRepositories:$DiscoverExisting
+if ($existingRoot) {
+    Write-SourceRoot -TargetRoot $InstallRoot -SourceRoot $existingRoot
+    Write-Host "Reusing existing Nemotron 3.5 ASR installation at $existingRoot."
+    return
+}
+if ($ReuseOnly) {
+    Write-Host "No reusable Nemotron installation was found."
+    return
 }
 
 $gpu = & nvidia-smi -L 2>$null
 if ($LASTEXITCODE -ne 0 -or -not ($gpu -match "GPU ")) {
     Write-Host "No usable NVIDIA GPU detected; Parley will use bundled CPU Whisper."
-    exit 0
+    return
 }
 
 # Each checkpoint instance is about 1.3 GB in FP16 and Parley's two concurrent
@@ -75,12 +195,13 @@ foreach ($row in $gpuRows) {
 }
 if (-not $eligibleGPU) {
     Write-Host "No NVIDIA GPU with at least 6 GiB VRAM and compute capability 7.0+ was found; using CPU Whisper."
-    exit 0
+    return
 }
 Write-Host "Eligible NVIDIA GPU detected: $eligibleGPU"
 
 New-Item -ItemType Directory -Force -Path $InstallRoot, $toolsDir, $modelDir | Out-Null
 Remove-Item $readyMarker -Force -ErrorAction SilentlyContinue
+Remove-Item $sourceRootMarker -Force -ErrorAction SilentlyContinue
 
 if (-not (Test-Path $uvExe)) {
     $asset = "uv-x86_64-pc-windows-msvc.zip"
@@ -104,12 +225,37 @@ if (-not (Test-Path $uvExe)) {
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $InstallRoot "python"
 $env:UV_CACHE_DIR = Join-Path $InstallRoot "cache/uv"
 $env:UV_LINK_MODE = "copy"
+
+# Keep the large cache private to Parley without hiding a token created by a
+# previous `hf auth login`. HF_TOKEN still takes precedence when explicitly set.
+if ([string]::IsNullOrWhiteSpace($env:HF_TOKEN) -and [string]::IsNullOrWhiteSpace($env:HF_TOKEN_PATH)) {
+    $userCache = if ([string]::IsNullOrWhiteSpace($env:XDG_CACHE_HOME)) {
+        Join-Path $HOME ".cache"
+    }
+    else {
+        $env:XDG_CACHE_HOME
+    }
+    $existingToken = Join-Path $userCache "huggingface/token"
+    if (Test-Path $existingToken) {
+        $env:HF_TOKEN_PATH = $existingToken
+        Write-Host "Using the existing Hugging Face login for authenticated downloads."
+    }
+}
 $env:HF_HOME = Join-Path $InstallRoot "cache/huggingface"
 $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+if ([string]::IsNullOrWhiteSpace($env:HF_XET_HIGH_PERFORMANCE)) {
+    $env:HF_XET_HIGH_PERFORMANCE = "1"
+}
+if ([string]::IsNullOrWhiteSpace($env:HF_HUB_DOWNLOAD_TIMEOUT)) {
+    $env:HF_HUB_DOWNLOAD_TIMEOUT = "60"
+}
 
 if (-not (Test-Path $pythonExe)) {
     Write-Host "Installing private Python 3.11 runtime..."
-    Invoke-Checked $uvExe python install 3.11
+    # The runtime is private to Parley; do not also create a user-profile Python
+    # shim under ~/.local/bin. A pre-existing shim is what produced the alarming
+    # but otherwise harmless "Executable already exists" warning in setup.
+    Invoke-Checked $uvExe python install 3.11 --no-bin
     Invoke-Checked $uvExe venv $venvDir --python 3.11 --managed-python
 }
 

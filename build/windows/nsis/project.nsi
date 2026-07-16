@@ -54,7 +54,6 @@ ManifestDPIAware true
 !define MUI_ICON "..\icon.ico"
 !define MUI_UNICON "..\icon.ico"
 # !define MUI_WELCOMEFINISHPAGE_BITMAP "resources\leftimage.bmp" #Include this to add a bitmap on the left side of the Welcome Page. Must be a size of 164x314
-!define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
 
 !insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
@@ -81,11 +80,14 @@ OutFile "..\..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the i
 ShowInstDetails show # This will always show the installation details.
 
 Var IsUpgrade
+Var NemotronRoot
+Var NemotronProvisionRequested
 
 Function .onInit
    !insertmacro wails.checkArchitecture
 
    StrCpy $IsUpgrade "0"
+   StrCpy $NemotronProvisionRequested "0"
 
    # On update, honor the location of a previously installed copy (recorded below
    # as InstallLocation) so we overwrite it in place instead of installing a
@@ -107,7 +109,7 @@ Section
 
     # When updating, close any running instance so its locked files (Parley.exe,
     # whisper DLLs) can be overwritten. Harmless no-op on a fresh install.
-    nsExec::Exec 'cmd /C taskkill /F /IM "${PRODUCT_EXECUTABLE}" >NUL 2>&1'
+    nsExec::Exec 'cmd /C taskkill /T /F /IM "${PRODUCT_EXECUTABLE}" >NUL 2>&1'
     Pop $0
 
     !insertmacro wails.webview2runtime
@@ -116,18 +118,32 @@ Section
 
     !insertmacro wails.files
 
-    # Bundle the CPU whisper transcription engine + model so every installation
-    # remains standalone. Replace shipped Whisper artifacts on upgrade, but do
-    # not remove resources/nemotron: that optional multi-GB install is persistent.
-    # resolveResource() in paths.go looks for resources/ next to the exe at runtime.
+    # Bundle only CPU Whisper plus the small Nemotron provisioner. Generated
+    # Nemotron model/runtime/cache directories in a developer checkout can total
+    # more than 10 GiB and must never be swept into a locally-built installer.
+    # Replace shipped Whisper artifacts on upgrade, but preserve the legacy
+    # resources/nemotron directory for users provisioned by older releases.
     RMDir /r "$INSTDIR\resources\whisper"
-    File /r "..\..\..\resources"
+    SetOutPath "$INSTDIR\resources\whisper"
+    File /r "..\..\..\resources\whisper\*"
+    SetOutPath "$INSTDIR\resources\nemotron"
+    File "..\..\..\resources\nemotron\download_model.py"
+    File "..\..\..\resources\nemotron\provision.ps1"
+    File "..\..\..\resources\nemotron\server.py"
+    File "..\..\..\resources\nemotron\setup.ps1"
+    File "..\..\..\resources\nemotron\validate_install.py"
 
-    # A complete Nemotron install is persistent and automatically preferred by
-    # the app. Fresh NVIDIA installs provision it automatically. On upgrades
-    # where it is missing (including an earlier partial download), ask before
-    # downloading several GB. Silent upgrades never start a surprise download.
-    # Every failure/decline remains non-fatal because CPU Whisper is bundled.
+    # New releases keep the multi-GB installation in per-user LocalAppData so
+    # installed and development builds can share it. Continue recognizing the
+    # legacy beside-the-exe location. A .source-root marker may point at a valid
+    # older checkout installation without copying or downloading it again.
+    StrCpy $NemotronRoot "$LOCALAPPDATA\Parley\nemotron"
+    IfFileExists "$NemotronRoot\.ready" nemotron_present nemotron_check_shared_source
+
+    nemotron_check_shared_source:
+        IfFileExists "$NemotronRoot\.source-root" nemotron_present nemotron_check_legacy
+
+    nemotron_check_legacy:
     IfFileExists "$INSTDIR\resources\nemotron\.ready" nemotron_present nemotron_probe_gpu
 
     nemotron_probe_gpu:
@@ -144,25 +160,15 @@ Section
     nemotron_gpu_found:
         StrCmp $IsUpgrade "0" nemotron_provision
         IfSilent nemotron_silent_skip
-        MessageBox MB_YESNO|MB_ICONQUESTION "Parley found an NVIDIA GPU, but Nemotron 3.5 ASR Streaming is not installed.$\r$\n$\r$\nDownload and install it now? This can download several gigabytes and may take several minutes. CPU Whisper remains available if you choose No." /SD IDNO IDYES nemotron_provision IDNO nemotron_declined
+        MessageBox MB_YESNO|MB_ICONQUESTION "Parley found an NVIDIA GPU, but Nemotron 3.5 ASR Streaming is not installed.$\r$\n$\r$\nFind or download it now? After Parley finishes installing, a separate progress window will open. You can close that window at any time to cancel; partial downloads are retained so a later attempt can resume. CPU Whisper remains available if you choose No." /SD IDNO IDYES nemotron_provision IDNO nemotron_declined
 
     nemotron_provision:
-        DetailPrint "NVIDIA GPU detected; provisioning Nemotron 3.5 ASR Streaming..."
-        # Launch 64-bit PowerShell so setup.ps1 can also resolve nvidia-smi and
-        # validate VRAM/compute capability without WOW64 redirection.
-        ${DisableX64FSRedirection}
-        nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\nemotron\setup.ps1" -InstallRoot "$INSTDIR\resources\nemotron"'
-        ${EnableX64FSRedirection}
-        Pop $1
-        StrCmp $1 "0" 0 nemotron_provision_failed
-        IfFileExists "$INSTDIR\resources\nemotron\.ready" nemotron_provisioned nemotron_not_ready
-
-    nemotron_provisioned:
-        DetailPrint "Nemotron provisioning completed; Parley will use it automatically."
+        StrCpy $NemotronProvisionRequested "1"
+        DetailPrint "Nemotron setup queued in a separate cancellable progress window."
         Goto nemotron_done
 
     nemotron_present:
-        DetailPrint "Existing Nemotron installation detected; Parley will use it automatically."
+        DetailPrint "Existing Nemotron installation detected; Parley will reuse it automatically."
         Goto nemotron_done
 
     nemotron_no_gpu:
@@ -176,13 +182,6 @@ Section
     nemotron_silent_skip:
         DetailPrint "Silent upgrade detected; skipping optional Nemotron download and using bundled CPU Whisper."
         Goto nemotron_done
-
-    nemotron_not_ready:
-        DetailPrint "Nemotron was not provisioned for this GPU; Parley will use bundled CPU Whisper."
-        Goto nemotron_done
-
-    nemotron_provision_failed:
-        DetailPrint "Nemotron provisioning did not complete (exit $1). Parley will use bundled CPU Whisper."
 
     nemotron_done:
 
@@ -203,6 +202,20 @@ Section
     !else
         WriteRegStr HKLM "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
     !endif
+
+    # Never hold the installer UI hostage to Python/PyTorch/Hugging Face work.
+    # The visible asynchronous window carries progress and may be closed to
+    # cancel. setup.ps1 retains caches/partial files so rerunning can resume.
+    StrCmp $NemotronProvisionRequested "1" 0 nemotron_launch_done
+    DetailPrint "Opening cancellable Nemotron setup window..."
+    ${DisableX64FSRedirection}
+    ClearErrors
+    Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\nemotron\provision.ps1" -InstallRoot "$NemotronRoot"'
+    ${EnableX64FSRedirection}
+    IfErrors 0 nemotron_launch_done
+    DetailPrint "Could not launch Nemotron setup; Parley will use bundled CPU Whisper."
+
+    nemotron_launch_done:
 SectionEnd
 
 Section "uninstall" 

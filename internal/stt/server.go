@@ -4,6 +4,7 @@ package stt
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,6 +27,7 @@ type Server struct {
 	cmd            *exec.Cmd
 	logFile        *os.File
 	done           chan error
+	releaseTree    func()
 }
 
 // HasNVIDIAGPU reports whether Windows can see at least one working NVIDIA GPU.
@@ -104,6 +106,13 @@ func (s *Server) Start(ctx context.Context) error {
 		s.closeLog()
 		return fmt.Errorf("start %s server: %w", s.name, err)
 	}
+	if release, err := superviseProcessTree(s.cmd.Process); err != nil {
+		// Direct-process termination below remains available if Windows refuses
+		// job assignment (for example under an unusually restrictive host job).
+		log.Printf("[stt] could not attach %s to kill-on-close process job: %v", s.name, err)
+	} else {
+		s.releaseTree = release
+	}
 	s.done = make(chan error, 1)
 	go func() {
 		s.done <- s.cmd.Wait()
@@ -149,6 +158,10 @@ func (s *Server) waitReady(ctx context.Context) error {
 
 // Stop terminates the subprocess if running.
 func (s *Server) Stop() {
+	if s.releaseTree != nil {
+		s.releaseTree()
+		s.releaseTree = nil
+	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 		if s.done != nil {

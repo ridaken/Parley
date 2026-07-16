@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // resolveResource locates a local transcription resource by checking
@@ -25,6 +26,77 @@ func resolveResource(rel string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("could not locate %q (searched %v)", rel, bases)
+}
+
+type nemotronInstall struct {
+	root   string
+	script string
+}
+
+// resolveNemotronInstall finds a complete Nemotron installation. New installs use
+// a stable per-user location so development and packaged builds share the same
+// multi-GB model. The resource lookup remains as a compatibility path for older
+// checkouts/installers that provisioned next to the executable.
+func resolveNemotronInstall() (nemotronInstall, error) {
+	var roots []string
+	if configured := strings.TrimSpace(os.Getenv("PARLEY_NEMOTRON_HOME")); configured != "" {
+		roots = append(roots, configured)
+	}
+	if localAppData, err := os.UserCacheDir(); err == nil {
+		roots = append(roots, filepath.Join(localAppData, "Parley", "nemotron"))
+	}
+	if ready, err := resolveResource(filepath.Join("resources", "nemotron", ".ready")); err == nil {
+		roots = append(roots, filepath.Dir(ready))
+	}
+
+	seen := make(map[string]bool)
+	var searched []string
+	for _, candidate := range roots {
+		root, err := filepath.Abs(candidate)
+		if err != nil || seen[root] {
+			continue
+		}
+		seen[root] = true
+		searched = append(searched, root)
+
+		provisionerRoot := root
+		if source, err := os.ReadFile(filepath.Join(root, ".source-root")); err == nil {
+			redirected := strings.TrimSpace(strings.TrimPrefix(string(source), "\ufeff"))
+			if redirected != "" {
+				root = redirected
+				searched = append(searched, root)
+			}
+		}
+		if completeNemotronRoot(root) {
+			script := filepath.Join(provisionerRoot, "server.py")
+			if _, err := os.Stat(script); err != nil {
+				script = filepath.Join(root, "server.py")
+			}
+			if _, err := os.Stat(script); err == nil {
+				return nemotronInstall{root: root, script: script}, nil
+			}
+		}
+	}
+	return nemotronInstall{}, fmt.Errorf("could not locate a complete Nemotron installation (searched %v)", searched)
+}
+
+func resolveNemotronRoot() (string, error) {
+	install, err := resolveNemotronInstall()
+	return install.root, err
+}
+
+func completeNemotronRoot(root string) bool {
+	for _, rel := range []string{
+		".ready",
+		filepath.Join("runtime", "Scripts", "python.exe"),
+		filepath.Join("model", "config.json"),
+		filepath.Join("model", "model.safetensors"),
+	} {
+		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // dataDir is the per-user app data directory.
