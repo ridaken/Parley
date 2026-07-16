@@ -639,11 +639,11 @@ func configuredTranscriptionLabel(settings store.Settings) string {
 // ListTranscriptionModels discovers the selectable local installations and the
 // always-available external-server choice.
 func (m *MeetingService) ListTranscriptionModels() ([]TranscriptionModelOption, error) {
-	whisperModels, _ := installedWhisperModels()
+	whisperModels, whisperModelsErr := installedWhisperModels()
 	_, whisperBinErr := resolveResource(filepath.Join("resources", "whisper", "bin", "Release", "whisper-server.exe"))
 	nemotronReason := nemotronUnavailableReason(m.hasNVIDIAGPU())
 	nemotronAvailable := nemotronReason == ""
-	whisperAvailable := whisperBinErr == nil && len(whisperModels) > 0
+	whisperAvailable := whisperModelsErr == nil && whisperBinErr == nil && len(whisperModels) > 0
 
 	auto := TranscriptionModelOption{
 		ID: "auto", Label: "Automatic (recommended)", Kind: "automatic",
@@ -651,7 +651,11 @@ func (m *MeetingService) ListTranscriptionModels() ([]TranscriptionModelOption, 
 		Available: nemotronAvailable || whisperAvailable,
 	}
 	if !auto.Available {
-		auto.UnavailableReason = "No usable local Nemotron or Whisper installation was found."
+		if whisperModelsErr != nil {
+			auto.UnavailableReason = "Could not read installed Whisper models: " + whisperModelsErr.Error()
+		} else {
+			auto.UnavailableReason = "No usable local Nemotron or Whisper installation was found."
+		}
 	}
 	options := []TranscriptionModelOption{auto, {
 		ID: "nemotron", Label: "Nemotron 3.5 ASR Streaming", Kind: "local",
