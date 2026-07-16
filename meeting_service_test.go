@@ -405,6 +405,16 @@ func TestExternalTranscriptionReachability(t *testing.T) {
 	}
 }
 
+func TestNemotronInventoryRecognizesSharedInstall(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared-nemotron")
+	writeCompleteNemotronRoot(t, root)
+	t.Setenv("PARLEY_NEMOTRON_HOME", root)
+
+	if reason := nemotronUnavailableReason(true); reason != "" {
+		t.Fatalf("shared Nemotron install reported unavailable: %s", reason)
+	}
+}
+
 func waitForLocalLoad(t *testing.T, m *MeetingService) {
 	t.Helper()
 	m.localMu.Lock()

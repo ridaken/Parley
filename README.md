@@ -1,14 +1,16 @@
 # Parley — local-first meeting assistant
 
-Parley listens to a live conversation (your microphone **and** the computer's own
-output audio, mixed), transcribes it locally, and uses an LLM to surface — in real
-time — the **current topic**, **assertions** made (attributed to *You* vs *Others*),
-a history of **past topics**, and **suggested questions**.
+Parley listens to a live conversation by capturing your microphone and the
+computer's output as separate, labelled sources. It transcribes them locally and
+uses an LLM to surface — in real time — the **current topic**, **assertions** made
+(attributed to *You* vs *Others*), a history of **past topics**, and **suggested
+questions**.
 
-It is **local-first**: audio and transcription stay on your machine. A fresh
-NVIDIA install downloads the optional local ASR runtime/model; during meetings,
-the only optional outbound path is an LLM endpoint you configure (which can also
-be local).
+It is **local-first**: the bundled transcription engines keep audio and
+transcription on your machine. Network traffic during a meeting goes only to the
+LLM endpoint you configure and, if you explicitly configure one, a remote
+transcription server. Both endpoints can be local. Installing the optional NVIDIA
+engine downloads its private runtime and model once from upstream repositories.
 
 - **Stack:** Wails 3 (alpha) · Go backend · React + TypeScript + Tailwind/shadcn UI
 - **Transcription:** Nemotron 3.5 ASR Streaming on NVIDIA; bundled CPU `whisper.cpp` fallback
@@ -18,7 +20,8 @@ be local).
 
 ## What works today
 
-- 🎙️ **Dual capture** — your mic (*You*) + system/loopback audio (*Others*), mixed.
+- 🎙️ **Dual capture** — your mic (*You*) + system/loopback audio (*Others*), kept
+  as separately labelled sources.
 - 📝 **Live transcript** with speaker labels, recorded to disk per source.
 - 🧠 **Live analysis** — current topic, assertions, past topics, suggested questions.
 - 🗒️ **Reusable context profiles** — agenda, attendees, notes to ground the analysis.
@@ -28,6 +31,8 @@ be local).
 - 🔌 **Bring-your-own transcription** — offload STT to a compatible remote server.
 - 🧰 **Saved LLM connections** — store multiple providers (local + cloud) and switch
   between them per meeting from the header, without re-entering URLs/keys each time.
+- 🔎 **Visible runtime details** — the footer shows the packaged Parley version and
+  the voice-to-text backend actually selected (Nemotron GPU, Whisper CPU, or remote).
 
 ---
 
@@ -65,9 +70,11 @@ flowchart TD
     STATE --> DB
 ```
 
-During a meeting, only the **LLM** call leaves the machine (and only if you point
-it at a remote endpoint). A fresh NVIDIA install also downloads the optional
-Nemotron runtime/model once. Audio and transcription stay local.
+With a bundled transcription engine, audio and transcription stay local. An LLM
+call leaves the machine only when its configured endpoint is remote; audio also
+leaves the machine when you explicitly configure a remote transcription URL.
+Installing Nemotron downloads its runtime/model once before a meeting, not while
+capturing audio.
 
 ### The analysis interval
 
@@ -168,12 +175,35 @@ boundaries. A shortened example looks like:
 
 ---
 
+## Install on Windows
+
+Download the latest `Parley-Setup-vX.Y.Z.exe` from
+[GitHub Releases](https://github.com/ridaken/Parley/releases/latest) and run it.
+The per-user installer does not require administrator access and includes the CPU
+Whisper engine/model, so local transcription needs no additional download or setup.
+
+On a fresh install, an eligible NVIDIA GPU triggers automatic Nemotron
+provisioning. On an interactive upgrade, the installer preserves an existing
+complete Nemotron installation; if Nemotron is missing and an NVIDIA GPU is
+detected, it asks before downloading several gigabytes. Declining or encountering
+a provisioning problem leaves the bundled CPU fallback available. Silent upgrades
+never begin the optional download.
+
+After launch, the footer shows the installed Parley version and the selected
+voice-to-text backend. The displayed app version is injected from the same version
+used for the GitHub release and installer.
+
+---
+
 ## Prerequisites
+
+These prerequisites are for building Parley from source; users installing the
+Windows release do not need them.
 
 | Tool | Notes |
 |------|-------|
 | [Go](https://go.dev/dl/) 1.25+ | Backend. |
-| Node.js 18+ / npm | Frontend. |
+| Node.js 20.19+ (or 22.12+) / npm | Frontend; required by Vite 8. |
 | [Wails 3 CLI](https://v3.wails.io/) | `go install github.com/wailsapp/wails/v3/cmd/wails3@latest` |
 | [Task](https://taskfile.dev/) | **Optional** shortcut runner for `Taskfile.yml`. See the note below. |
 | **A C compiler (cgo)** | Required by the audio library (`malgo`). See per-OS notes. |
@@ -199,19 +229,23 @@ Audio capture uses miniaudio via cgo, so a C compiler must be on `PATH`:
 
 ## Local transcription engines
 
-On Windows, a fresh packaged install checks for an NVIDIA GPU. If one is
-available with at least 6 GiB VRAM and compute capability 7.0, the installer provisions
+On Windows, a packaged install checks for an NVIDIA GPU. If one is available with
+at least 6 GiB VRAM and compute capability 7.0, a fresh install provisions
 [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 plus its private Python/CUDA runtime under `resources/nemotron/`. Only the 2.55 GB
 Transformers checkpoint is fetched; the duplicate 2.37 GB NeMo archive is excluded.
-The resulting installation is reused in place on app upgrades, so upgrades do not
-redownload the model.
+The resulting installation is reused in place on app upgrades, so a complete model
+is not redownloaded. An interactive upgrade prompts before provisioning when the
+`.ready` marker is missing; a silent upgrade keeps CPU Whisper instead.
 
 Nemotron is Parley's preferred NVIDIA backend. It is a 600M-parameter,
 cache-aware FastConformer-RNNT model with punctuation and capitalization. If GPU
 provisioning or model startup fails for any reason, Parley automatically uses the
 small CPU Whisper engine that is included in every installer. Provisioning failure
-does not fail the Parley install.
+does not fail the Parley install. Parley begins loading the selected local engine in
+the background as soon as the app opens and keeps it warm between meetings. The
+footer reports loading progress and the backend that was actually selected, including
+a CPU fallback after a failed Nemotron startup.
 
 ### Developer setup
 
@@ -314,15 +348,15 @@ no meeting is active. Starting a meeting automatically reloads a stopped local m
 task dev        # no Task? → wails3 dev -config ./build/config.yml -port 9245
 
 # Production build → ./bin
-task build      # no Task? → wails3 task build
+wails3 build    # equivalent task form: wails3 task build (or task build)
 
 # Package an installer
-task package    # no Task? → wails3 task package
+wails3 task package    # equivalent if Task is installed: task package
 ```
 
-> The `build`/`package` recipes set important flags (e.g. `-H windowsgui`, so no
-> console window appears). Prefer `task …` or `wails3 task …` over a bare
-> `wails3 build` so those flags are applied — or install Task (see Prerequisites).
+The configured build tasks set required production flags such as `-H windowsgui`
+on Windows. `wails3 build` invokes that configured build path; `wails3 task build`
+and `task build` are equivalent alternatives.
 
 When packaging, make sure `resources/` ships **next to the executable** (Parley
 searches the working dir and the exe's directory + parents). Release CI embeds the
@@ -341,9 +375,12 @@ Nemotron model or Python/CUDA runtime.
 3. **Settings** (gear icon): save one **LLM connection** per provider (name, base
    URL, model, optional API key) — a local llama-server / LM Studio / Ollama, or a
    cloud URL. Mark one **active** (★), **Test** each, and set the analysis interval
-   and choose/manage the transcription model. Switch which LLM connection a meeting uses from the
-   **LLM connection dropdown in the header** (before you start the meeting).
-4. **Start listening.** The transcript streams on the left; the current topic strip
+   and choose/manage the transcription model. Switch which LLM connection a meeting
+   uses from the **LLM connection dropdown in the header** (before you start the meeting).
+4. Check the footer for the installed version and selected **Voice-to-text** model.
+   Local model weights begin loading when Parley opens; if the footer still says
+   *Loading local model…*, starting a meeting waits only for the remaining load time.
+5. **Start listening.** The transcript streams on the left; the current topic strip
    and the discussion outline / assertions / action items / suggested questions
    workbench update on the right.
 
@@ -387,12 +424,20 @@ pre-meeting context followed by every timestamped transcript line.
   and writes full details to **`parley.log`** in your app-data folder (Windows:
   `%AppData%\Parley\`). For a packaged build, the `resources/whisper/` folder must sit
   next to the `.exe`.
-- **Automatic did not select Nemotron on an NVIDIA system.** Check
+- **The installer says no NVIDIA GPU, but `nvidia-smi -L` shows one.** Install
+  Parley **v0.1.3 or newer**. Older installers ran the 64-bit NVIDIA utility through
+  a redirected 32-bit shell, which could incorrectly report no GPU.
+- **Automatic did not select Nemotron on an NVIDIA system.** The footer shows the
+  backend Parley actually selected. Check
   `%AppData%\Parley\nemotron-server.log`. Parley requires a complete
-  `resources\nemotron` installation with a `.ready` marker and falls back to CPU
-  Whisper when the model cannot load. An explicitly selected Nemotron reports the
-  failure instead of silently switching models. Re-run `resources\nemotron\setup.ps1` to
-  resume an interrupted first-install download; it reuses files already present.
+  Nemotron installation with a `.ready` marker and falls back to CPU Whisper when
+  the model cannot load. An explicitly selected Nemotron reports the failure instead
+  of silently switching models. On an installed per-user copy, close Parley and
+  resume provisioning from 64-bit PowerShell; the script reuses files already present:
+
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Parley\resources\nemotron\setup.ps1" -InstallRoot "$env:LOCALAPPDATA\Parley\nemotron"
+  ```
 - **"No mic" with a mic selected.** The badge now reflects whether a microphone source
   actually started. If it still says *No mic*, that device failed to open (wrong device,
   in use, or unsupported format) — check `parley.log` and try another device.
@@ -435,7 +480,9 @@ pre-meeting context followed by every timestamped transcript line.
   on Windows). Each LLM connection's API key is stored in the **OS keychain** (one
   entry per connection), never in the database.
 - No telemetry. Transcription is local unless you opt into a remote STT URL; the LLM is
-  whatever endpoint you configure (point it at localhost to stay fully offline).
+  whatever endpoint you configure. Keep both endpoints on localhost to remain fully
+  offline during meetings. Installing Nemotron separately requires its one-time model
+  and runtime downloads.
 
 ---
 

@@ -116,7 +116,7 @@ export interface Settings {
 
     /**
      * SttBaseURL, when set, points transcription at a remote /inference-compatible
-     * server. It is used only when SttEngine is "external".
+     * server (e.g. http://host:8765). It is used only when SttEngine is "external".
      */
     "sttBaseURL": string;
 

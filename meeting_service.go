@@ -151,8 +151,8 @@ type MeetingService struct {
 
 	// The local transcription server belongs to the app, not an individual
 	// meeting. ServiceStartup begins loading it in the background; Start waits on
-	// the same result if preparation is still underway, and ServiceShutdown is the
-	// only normal path that releases the model weights.
+	// the same result if preparation is still underway. Idle lifecycle controls or
+	// ServiceShutdown can release the model weights.
 	localMu     sync.Mutex
 	localDone   chan struct{}
 	localCancel context.CancelFunc
@@ -367,22 +367,15 @@ func (m *MeetingService) start(resumeID int64) error {
 // The .ready marker is deliberately required so an interrupted installer download
 // is never mistaken for a usable model installation.
 func newNemotronServer() (*stt.Server, error) {
-	ready, err := resolveResource(filepath.Join("resources", "nemotron", ".ready"))
+	install, err := resolveNemotronInstall()
 	if err != nil {
 		return nil, err
 	}
-	python, err := resolveResource(filepath.Join("resources", "nemotron", "runtime", "Scripts", "python.exe"))
-	if err != nil {
-		return nil, err
-	}
-	script, err := resolveResource(filepath.Join("resources", "nemotron", "server.py"))
-	if err != nil {
-		return nil, err
-	}
-	modelDir, err := resolveResource(filepath.Join("resources", "nemotron", "model"))
-	if err != nil {
-		return nil, err
-	}
+	root := install.root
+	ready := filepath.Join(root, ".ready")
+	python := filepath.Join(root, "runtime", "Scripts", "python.exe")
+	script := install.script
+	modelDir := filepath.Join(root, "model")
 	config := filepath.Join(modelDir, "config.json")
 	weights := filepath.Join(modelDir, "model.safetensors")
 	args := []string{
@@ -896,17 +889,8 @@ func nemotronUnavailableReason(hasGPU bool) string {
 	if !hasGPU {
 		return "A working NVIDIA GPU was not detected."
 	}
-	paths := []string{
-		filepath.Join("resources", "nemotron", ".ready"),
-		filepath.Join("resources", "nemotron", "runtime", "Scripts", "python.exe"),
-		filepath.Join("resources", "nemotron", "server.py"),
-		filepath.Join("resources", "nemotron", "model", "config.json"),
-		filepath.Join("resources", "nemotron", "model", "model.safetensors"),
-	}
-	for _, path := range paths {
-		if _, err := resolveResource(path); err != nil {
-			return "The Nemotron runtime or model installation is incomplete."
-		}
+	if _, err := resolveNemotronInstall(); err != nil {
+		return "The Nemotron runtime or model installation is incomplete."
 	}
 	return ""
 }
@@ -1332,6 +1316,10 @@ func (m *MeetingService) exportMarkdownFile(sessionID int64, dialogTitle, filena
 	}
 	if filename == "" {
 		filename = fmt.Sprintf("meeting-%d", sessionID)
+	}
+	hasExt := strings.HasSuffix(strings.ToLower(filename), ".md")
+	if hasExt {
+		filename = filename[:len(filename)-3]
 	}
 	filename += filenameSuffix
 	if !strings.HasSuffix(strings.ToLower(filename), ".md") {

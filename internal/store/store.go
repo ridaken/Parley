@@ -50,7 +50,7 @@ type Settings struct {
 	// "whisper", or "external". Auto preserves the original GPU-first fallback.
 	SttEngine string `json:"sttEngine"`
 	// SttBaseURL, when set, points transcription at a remote /inference-compatible
-	// server. It is used only when SttEngine is "external".
+	// server (e.g. http://host:8765). It is used only when SttEngine is "external".
 	SttBaseURL string `json:"sttBaseURL"`
 	// WhisperModel is the model filename under resources/whisper/models used by the
 	// bundled engine. Defaults to ggml-small.en-q5_1.bin (quantized; accurate but
