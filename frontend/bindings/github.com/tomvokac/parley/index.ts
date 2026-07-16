@@ -12,5 +12,7 @@ export type {
     AnalysisStatusEvent,
     LoadedSession,
     RuntimeInfo,
-    StatusEvent
+    StatusEvent,
+    TranscriptionConfig,
+    TranscriptionModelOption
 } from "./models.js";

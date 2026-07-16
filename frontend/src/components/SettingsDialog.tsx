@@ -3,13 +3,20 @@ import {
   CheckCircle2,
   Loader2,
   Pencil,
+  Play,
   Plus,
+  RefreshCw,
+  Square,
   Star,
   Trash2,
   XCircle,
 } from "lucide-react";
 
-import { LibraryService } from "../../bindings/github.com/tomvokac/parley";
+import { LibraryService, MeetingService } from "../../bindings/github.com/tomvokac/parley";
+import type {
+  RuntimeInfo,
+  TranscriptionModelOption,
+} from "../../bindings/github.com/tomvokac/parley";
 import type {
   Settings,
   LLMConnection,
@@ -44,10 +51,35 @@ const DEFAULTS: Settings = {
   activeProfileID: 0,
   hasAPIKey: false,
   captureSources: [],
+  sttEngine: "auto",
   sttBaseURL: "",
   whisperModel: "ggml-small.en-q5_1.bin",
   activeLLMConnectionID: 0,
 };
+
+function transcriptionModelID(settings: Settings): string {
+  if (settings.sttEngine === "nemotron" || settings.sttEngine === "external") {
+    return settings.sttEngine;
+  }
+  if (settings.sttEngine === "whisper") {
+    return `whisper:${settings.whisperModel}`;
+  }
+  return "auto";
+}
+
+function selectTranscriptionModel(settings: Settings, modelID: string): Settings {
+  if (modelID === "auto" || modelID === "nemotron" || modelID === "external") {
+    return { ...settings, sttEngine: modelID };
+  }
+  if (modelID.startsWith("whisper:")) {
+    return {
+      ...settings,
+      sttEngine: "whisper",
+      whisperModel: modelID.slice("whisper:".length),
+    };
+  }
+  return settings;
+}
 
 const blankConn = (): LLMConnection => ({
   id: 0,
@@ -79,9 +111,13 @@ function friendlyError(raw: string): string {
 export function SettingsDialog({
   open,
   onOpenChange,
+  meetingActive,
+  runtimeInfo,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
+  meetingActive: boolean;
+  runtimeInfo: RuntimeInfo;
 }) {
   const [settings, setSettings] = useState<Settings>(DEFAULTS);
   const [conns, setConns] = useState<LLMConnection[]>([]);
@@ -90,6 +126,11 @@ export function SettingsDialog({
   const [apiKey, setApiKey] = useState("");
   const [test, setTest] = useState<"idle" | "running" | "ok" | "fail">("idle");
   const [testMsg, setTestMsg] = useState("");
+  const [transcriptionModels, setTranscriptionModels] = useState<TranscriptionModelOption[]>([]);
+  const [savedTranscription, setSavedTranscription] = useState({ modelID: "auto", externalURL: "" });
+  const [modelAction, setModelAction] = useState<"" | "saving" | "starting" | "stopping" | "restarting" | "testing">("");
+  const [modelMessage, setModelMessage] = useState("");
+  const [modelTestOK, setModelTestOK] = useState(false);
 
   const loadConns = () => LibraryService.ListLLMConnections().then((c) => setConns(c ?? []));
 
@@ -99,15 +140,74 @@ export function SettingsDialog({
     setApiKey("");
     setTest("idle");
     setTestMsg("");
+    setModelAction("");
+    setModelMessage("");
+    setModelTestOK(false);
+    setTranscriptionModels([]);
     LibraryService.GetSettings()
-      .then((s) => setSettings(s ?? DEFAULTS))
-      .catch(() => setSettings(DEFAULTS));
+      .then((s) => {
+        const loaded = s ?? DEFAULTS;
+        setSettings(loaded);
+        setSavedTranscription({
+          modelID: transcriptionModelID(loaded),
+          externalURL: loaded.sttBaseURL.trim().replace(/\/+$/, ""),
+        });
+      })
+      .catch(() => {
+        setSettings(DEFAULTS);
+        setSavedTranscription({ modelID: "auto", externalURL: "" });
+      });
+
+    MeetingService.ListTranscriptionModels()
+      .then((models) => setTranscriptionModels(models ?? []))
+      .catch(() => setTranscriptionModels([]));
     loadConns().catch(() => setConns([]));
   }, [open]);
 
   const saveOther = async () => {
-    await LibraryService.SaveSettings(settings);
-    onOpenChange(false);
+    setModelAction("saving");
+    setModelMessage("");
+    try {
+      const modelID = transcriptionModelID(settings);
+      const externalURL = settings.sttBaseURL.trim().replace(/\/+$/, "");
+      await MeetingService.ConfigureTranscription({ modelID, externalURL });
+      await LibraryService.SaveSettings({ ...settings, sttBaseURL: externalURL });
+      onOpenChange(false);
+    } catch (e: any) {
+      setModelMessage(friendlyError(String(e?.message ?? e)));
+    } finally {
+      setModelAction("");
+    }
+  };
+
+  const runModelAction = async (action: "starting" | "stopping" | "restarting") => {
+    setModelAction(action);
+    setModelMessage("");
+    setModelTestOK(false);
+    try {
+      if (action === "starting") await MeetingService.StartTranscriptionModel();
+      if (action === "stopping") await MeetingService.StopTranscriptionModel();
+      if (action === "restarting") await MeetingService.RestartTranscriptionModel();
+    } catch (e: any) {
+      setModelMessage(friendlyError(String(e?.message ?? e)));
+    } finally {
+      setModelAction("");
+    }
+  };
+
+  const testExternal = async () => {
+    setModelAction("testing");
+    setModelMessage("");
+    setModelTestOK(false);
+    try {
+      await MeetingService.TestExternalTranscription(settings.sttBaseURL);
+      setModelTestOK(true);
+      setModelMessage("Connected — the external transcription server responded.");
+    } catch (e: any) {
+      setModelMessage(friendlyError(String(e?.message ?? e)));
+    } finally {
+      setModelAction("");
+    }
   };
 
   const setActive = async (id: number) => {
@@ -154,6 +254,14 @@ export function SettingsDialog({
   };
 
   const canSaveConn = !!editing?.name.trim() && !!editing?.baseURL.trim();
+  const selectedModelID = transcriptionModelID(settings);
+  const selectedModel = transcriptionModels.find((model) => model.id === selectedModelID);
+  const normalizedExternalURL = settings.sttBaseURL.trim().replace(/\/+$/, "");
+  const modelDirty =
+    selectedModelID !== savedTranscription.modelID ||
+    (selectedModelID === "external" && normalizedExternalURL !== savedTranscription.externalURL);
+  const lifecycleDisabled = meetingActive || modelDirty || modelAction !== "";
+  const isLocalRuntime = runtimeInfo.transcriptionKind !== "external";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -373,43 +481,156 @@ export function SettingsDialog({
             <div className="mb-2 text-sm font-medium">Transcription</div>
             <div className="flex flex-col gap-3">
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="stturl">Remote transcription URL (optional)</Label>
-                <Input
-                  id="stturl"
-                  value={settings.sttBaseURL}
-                  placeholder="leave blank to use the bundled engine"
-                  onChange={(e) => setSettings({ ...settings, sttBaseURL: e.target.value })}
-                />
+                <Label htmlFor="transcription-model">Model</Label>
+                <Select
+                  value={selectedModelID}
+                  disabled={meetingActive || modelAction !== ""}
+                  onValueChange={(modelID) => {
+                    setSettings((current) => selectTranscriptionModel(current, modelID));
+                    setModelMessage("");
+                    setModelTestOK(false);
+                  }}
+                >
+                  <SelectTrigger id="transcription-model">
+                    <SelectValue placeholder="Choose a transcription model" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {transcriptionModels.map((model) => (
+                      <SelectItem key={model.id} value={model.id} disabled={!model.available}>
+                        {model.label}{!model.available ? " — unavailable" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <p className="text-[11px] leading-snug text-muted-foreground">
-                  Blank = transcribe locally (private, no setup), using Nemotron on a
-                  supported NVIDIA GPU or the bundled CPU Whisper fallback. Set this
-                  to a compatible server URL (e.g.
-                  http://192.168.1.10:8765) to offload transcription to another machine.
+                  {selectedModel?.unavailableReason || selectedModel?.detail ||
+                    "Installed local models and compatible external servers appear here."}
                 </p>
               </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="whispermodel">Bundled CPU fallback model</Label>
-                <Input
-                  id="whispermodel"
-                  value={settings.whisperModel}
-                  placeholder="ggml-small.en-q5_1.bin"
-                  disabled={!!settings.sttBaseURL.trim()}
-                  onChange={(e) => setSettings({ ...settings, whisperModel: e.target.value })}
-                />
-                <p className="text-[11px] leading-snug text-muted-foreground">
-                  Filename under resources/whisper/models. Defaults to
-                  ggml-small.en-q5_1.bin — quantized, accurate on names/jargon, and
-                  light enough to leave your laptop free for other work. Drop in
-                  ggml-base.en.bin for a lighter load, or ggml-large-v3-turbo-q5_0.bin
-                  for top accuracy if you have CPU headroom.
-                </p>
+
+              {selectedModelID === "external" && (
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="stturl">External server URL</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="stturl"
+                      value={settings.sttBaseURL}
+                      placeholder="http://192.168.1.10:8765"
+                      disabled={meetingActive || modelAction === "saving"}
+                      onChange={(e) => {
+                        setSettings({ ...settings, sttBaseURL: e.target.value });
+                        setModelMessage("");
+                        setModelTestOK(false);
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={!settings.sttBaseURL.trim() || modelAction !== ""}
+                      onClick={testExternal}
+                    >
+                      {modelAction === "testing" ? <Loader2 className="animate-spin" /> : null}
+                      Test
+                    </Button>
+                  </div>
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    Parley sends audio to the server's /inference endpoint but does not
+                    start, stop, or restart the remote process.
+                  </p>
+                </div>
+              )}
+
+              <div className="rounded-md border bg-muted/20 p-3">
+                <div className="flex items-start gap-2">
+                  {runtimeInfo.transcriptionStatus === "loading" ? (
+                    <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />
+                  ) : runtimeInfo.transcriptionStatus === "ready" || runtimeInfo.transcriptionStatus === "configured" ? (
+                    <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+                  ) : runtimeInfo.transcriptionStatus === "error" ? (
+                    <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+                  ) : (
+                    <Square className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-medium">
+                      {runtimeInfo.transcriptionModel || "Transcription model"}
+                    </div>
+                    <div className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                      {modelDirty
+                        ? "Save these settings to apply the selected model."
+                        : runtimeInfo.transcriptionMessage || "Model status unavailable."}
+                    </div>
+                  </div>
+                </div>
+
+                {isLocalRuntime && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={lifecycleDisabled || !["stopped", "error"].includes(runtimeInfo.transcriptionStatus)}
+                      onClick={() => runModelAction("starting")}
+                    >
+                      {modelAction === "starting" ? <Loader2 className="animate-spin" /> : <Play />}
+                      Start
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={lifecycleDisabled || !["loading", "ready"].includes(runtimeInfo.transcriptionStatus)}
+                      onClick={() => runModelAction("stopping")}
+                    >
+                      {modelAction === "stopping" ? <Loader2 className="animate-spin" /> : <Square />}
+                      Stop
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={lifecycleDisabled || !["loading", "ready", "error"].includes(runtimeInfo.transcriptionStatus)}
+                      onClick={() => runModelAction("restarting")}
+                    >
+                      {modelAction === "restarting" ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                      Restart
+                    </Button>
+                  </div>
+                )}
+
+                {meetingActive && (
+                  <p className="mt-2 text-[11px] text-amber-400">
+                    Stop the active meeting before changing or restarting transcription.
+                  </p>
+                )}
               </div>
+
+              {modelMessage && (
+                <div
+                  className={cn(
+                    "flex items-start gap-2 rounded-md border p-2 text-xs",
+                    modelTestOK
+                      ? "border-emerald-500/30 text-emerald-400"
+                      : "border-destructive/30 text-destructive"
+                  )}
+                >
+                  {modelTestOK ? (
+                    <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  ) : (
+                    <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <span className="min-w-0 break-words">{modelMessage}</span>
+                </div>
+              )}
             </div>
           </div>
         </div>
 
         <DialogFooter>
-          <Button onClick={saveOther}>Save</Button>
+          <Button disabled={modelAction !== ""} onClick={saveOther}>
+            {modelAction === "saving" && <Loader2 className="animate-spin" />}
+            Save
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

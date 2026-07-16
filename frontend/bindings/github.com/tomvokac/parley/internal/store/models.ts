@@ -109,8 +109,14 @@ export interface Settings {
     "captureSources": CaptureSource[] | null;
 
     /**
+     * SttEngine selects how transcription is provided: "auto", "nemotron",
+     * "whisper", or "external". Auto preserves the original GPU-first fallback.
+     */
+    "sttEngine": string;
+
+    /**
      * SttBaseURL, when set, points transcription at a remote /inference-compatible
-     * server (e.g. http://host:8765) instead of launching a local engine.
+     * server (e.g. http://host:8765). It is used only when SttEngine is "external".
      */
     "sttBaseURL": string;
 

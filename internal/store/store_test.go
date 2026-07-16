@@ -20,17 +20,41 @@ func TestSettingsDefaultsAndUpdate(t *testing.T) {
 	if got.LoggingLevel != "trace" {
 		t.Fatalf("logging level default = %q, want trace", got.LoggingLevel)
 	}
+	if got.SttEngine != "auto" {
+		t.Fatalf("transcription engine default = %q, want auto", got.SttEngine)
+	}
 
 	got.LLMModel = "qwen2.5"
 	got.AnalysisIntervalSec = 20
 	got.AnalysisTimeoutSec = 45
 	got.LoggingLevel = "error"
+	got.SttEngine = "whisper"
+	got.WhisperModel = "ggml-base.en.bin"
 	if err := s.SaveSettings(got); err != nil {
 		t.Fatalf("SaveSettings: %v", err)
 	}
 	again, _ := s.GetSettings()
-	if again.LLMModel != "qwen2.5" || again.AnalysisIntervalSec != 20 || again.AnalysisTimeoutSec != 45 || again.LoggingLevel != "error" {
+	if again.LLMModel != "qwen2.5" || again.AnalysisIntervalSec != 20 || again.AnalysisTimeoutSec != 45 || again.LoggingLevel != "error" || again.SttEngine != "whisper" || again.WhisperModel != "ggml-base.en.bin" {
 		t.Fatalf("settings not persisted: %+v", again)
+	}
+}
+
+func TestLegacyRemoteSettingsMigrateToExternalEngine(t *testing.T) {
+	s := openTemp(t)
+	if _, err := s.db.Exec(`UPDATE settings SET stt_engine = '', stt_base_url = 'http://stt.local:8765' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE settings
+		SET stt_engine = CASE WHEN TRIM(stt_base_url) <> '' THEN 'external' ELSE 'auto' END
+		WHERE TRIM(stt_engine) = ''`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SttEngine != "external" {
+		t.Fatalf("legacy remote engine = %q, want external", got.SttEngine)
 	}
 }
 

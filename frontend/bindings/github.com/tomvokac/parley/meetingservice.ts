@@ -31,6 +31,14 @@ export function AddLiveNote(scope: string, text: string): $CancellablePromise<st
 }
 
 /**
+ * ConfigureTranscription validates and persists a model selection, then
+ * reconciles the idle runtime. Local loading continues asynchronously.
+ */
+export function ConfigureTranscription(config: $models.TranscriptionConfig): $CancellablePromise<void> {
+    return $Call.ByID(713856948, config);
+}
+
+/**
  * DeleteSession permanently removes a saved meeting (not the one in progress).
  */
 export function DeleteSession(id: number): $CancellablePromise<void> {
@@ -86,6 +94,14 @@ export function ListSessions(): $CancellablePromise<store$0.Session[] | null> {
 }
 
 /**
+ * ListTranscriptionModels discovers the selectable local installations and the
+ * always-available external-server choice.
+ */
+export function ListTranscriptionModels(): $CancellablePromise<$models.TranscriptionModelOption[] | null> {
+    return $Call.ByID(1026157818);
+}
+
+/**
  * LoadSession returns a saved meeting's full state for display.
  */
 export function LoadSession(id: number): $CancellablePromise<$models.LoadedSession> {
@@ -97,6 +113,13 @@ export function LoadSession(id: number): $CancellablePromise<$models.LoadedSessi
  */
 export function RenameSession(id: number, title: string): $CancellablePromise<void> {
     return $Call.ByID(3925232594, id, title);
+}
+
+/**
+ * RestartTranscriptionModel replaces the current local process with a fresh load.
+ */
+export function RestartTranscriptionModel(): $CancellablePromise<void> {
+    return $Call.ByID(3040477430);
 }
 
 /**
@@ -116,8 +139,31 @@ export function Start(): $CancellablePromise<void> {
 }
 
 /**
+ * StartTranscriptionModel loads the selected local model without starting a meeting.
+ */
+export function StartTranscriptionModel(): $CancellablePromise<void> {
+    return $Call.ByID(2331669113);
+}
+
+/**
  * Stop ends the session, flushing the final audio and closing recordings.
  */
 export function Stop(): $CancellablePromise<void> {
     return $Call.ByID(252224180);
+}
+
+/**
+ * StopTranscriptionModel releases the selected local model while Parley is idle.
+ */
+export function StopTranscriptionModel(): $CancellablePromise<void> {
+    return $Call.ByID(207813981);
+}
+
+/**
+ * TestExternalTranscription verifies that an external HTTP server is reachable.
+ * Any HTTP response counts as reachable; the inference path is exercised by the
+ * first real transcription request.
+ */
+export function TestExternalTranscription(baseURL: string): $CancellablePromise<void> {
+    return $Call.ByID(1170675977, baseURL);
 }

@@ -46,8 +46,11 @@ type Settings struct {
 	ActiveProfileID     int64           `json:"activeProfileID"`
 	HasAPIKey           bool            `json:"hasAPIKey"`
 	CaptureSources      []CaptureSource `json:"captureSources"`
+	// SttEngine selects how transcription is provided: "auto", "nemotron",
+	// "whisper", or "external". Auto preserves the original GPU-first fallback.
+	SttEngine string `json:"sttEngine"`
 	// SttBaseURL, when set, points transcription at a remote /inference-compatible
-	// server (e.g. http://host:8765) instead of launching a local engine.
+	// server (e.g. http://host:8765). It is used only when SttEngine is "external".
 	SttBaseURL string `json:"sttBaseURL"`
 	// WhisperModel is the model filename under resources/whisper/models used by the
 	// bundled engine. Defaults to ggml-small.en-q5_1.bin (quantized; accurate but
@@ -169,6 +172,17 @@ CREATE TABLE IF NOT EXISTS llm_connections (
 	if err := s.addColumn("settings", "stt_base_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.addColumn("settings", "stt_engine", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// A blank value only exists on databases created before explicit engine
+	// selection. Preserve their old behavior: a configured URL meant remote;
+	// otherwise Parley automatically preferred Nemotron and fell back to Whisper.
+	if _, err := s.db.Exec(`UPDATE settings
+		SET stt_engine = CASE WHEN TRIM(stt_base_url) <> '' THEN 'external' ELSE 'auto' END
+		WHERE TRIM(stt_engine) = ''`); err != nil {
+		return err
+	}
 	if err := s.addColumn("settings", "whisper_model", "TEXT NOT NULL DEFAULT 'ggml-small.en-q5_1.bin'"); err != nil {
 		return err
 	}
@@ -240,8 +254,8 @@ func (s *Store) addColumn(table, column, decl string) error {
 func (s *Store) GetSettings() (Settings, error) {
 	var st Settings
 	var sourcesJSON string
-	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, analysis_timeout_sec, logging_level, active_profile_id, capture_sources, stt_base_url, whisper_model, active_llm_connection_id FROM settings WHERE id = 1`)
-	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.AnalysisTimeoutSec, &st.LoggingLevel, &st.ActiveProfileID, &sourcesJSON, &st.SttBaseURL, &st.WhisperModel, &st.ActiveLLMConnectionID); err != nil {
+	row := s.db.QueryRow(`SELECT llm_base_url, llm_model, analysis_interval_sec, analysis_timeout_sec, logging_level, active_profile_id, capture_sources, stt_engine, stt_base_url, whisper_model, active_llm_connection_id FROM settings WHERE id = 1`)
+	if err := row.Scan(&st.LLMBaseURL, &st.LLMModel, &st.AnalysisIntervalSec, &st.AnalysisTimeoutSec, &st.LoggingLevel, &st.ActiveProfileID, &sourcesJSON, &st.SttEngine, &st.SttBaseURL, &st.WhisperModel, &st.ActiveLLMConnectionID); err != nil {
 		return Settings{}, err
 	}
 	if st.AnalysisIntervalSec <= 0 {
@@ -253,6 +267,7 @@ func (s *Store) GetSettings() (Settings, error) {
 	if st.WhisperModel == "" {
 		st.WhisperModel = "ggml-small.en-q5_1.bin"
 	}
+	st.SttEngine = normalizeSTTEngine(st.SttEngine, st.SttBaseURL)
 	st.LoggingLevel = normalizeLoggingLevel(st.LoggingLevel)
 	st.CaptureSources = []CaptureSource{}
 	if sourcesJSON != "" {
@@ -275,10 +290,35 @@ func (s *Store) SaveSettings(st Settings) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, analysis_timeout_sec = ?, logging_level = ?, active_profile_id = ?, capture_sources = ?, stt_base_url = ?, whisper_model = ?, active_llm_connection_id = ? WHERE id = 1`,
-		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.AnalysisTimeoutSec, normalizeLoggingLevel(st.LoggingLevel), st.ActiveProfileID, string(sourcesJSON), st.SttBaseURL, st.WhisperModel, st.ActiveLLMConnectionID,
+		`UPDATE settings SET llm_base_url = ?, llm_model = ?, analysis_interval_sec = ?, analysis_timeout_sec = ?, logging_level = ?, active_profile_id = ?, capture_sources = ?, stt_engine = ?, stt_base_url = ?, whisper_model = ?, active_llm_connection_id = ? WHERE id = 1`,
+		st.LLMBaseURL, st.LLMModel, st.AnalysisIntervalSec, st.AnalysisTimeoutSec, normalizeLoggingLevel(st.LoggingLevel), st.ActiveProfileID, string(sourcesJSON), normalizeSTTEngine(st.SttEngine, st.SttBaseURL), st.SttBaseURL, st.WhisperModel, st.ActiveLLMConnectionID,
 	)
 	return err
+}
+
+// SaveTranscriptionSettings updates only transcription configuration so the
+// lifecycle service can validate and persist a model change atomically without
+// overwriting unrelated edits in the Settings dialog.
+func (s *Store) SaveTranscriptionSettings(engine, baseURL, whisperModel string) error {
+	_, err := s.db.Exec(
+		`UPDATE settings SET stt_engine = ?, stt_base_url = ?, whisper_model = ? WHERE id = 1`,
+		normalizeSTTEngine(engine, baseURL), strings.TrimSpace(baseURL), strings.TrimSpace(whisperModel),
+	)
+	return err
+}
+
+func normalizeSTTEngine(engine, baseURL string) string {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "nemotron", "whisper", "external":
+		return strings.ToLower(strings.TrimSpace(engine))
+	case "auto":
+		return "auto"
+	default:
+		if strings.TrimSpace(baseURL) != "" {
+			return "external"
+		}
+		return "auto"
+	}
 }
 
 func normalizeLoggingLevel(level string) string {
